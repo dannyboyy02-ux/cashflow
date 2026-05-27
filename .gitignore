@@ -1,0 +1,37 @@
+# Environment
+.env
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Data — never commit
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.parquet
+
+# Excel
+*.xlsx
+*.xlsm
+*.xls
+~$*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log

@@ -1,0 +1,15 @@
+# Cash flow workbook — non-sensitive configuration
+# Secrets and environment-specific paths live in .env (gitignored)
+
+forecast:
+  horizon_weeks: 13
+  refresh_day: monday
+
+paths:
+  data_dir: data
+  workbook_template: workbook/template.xlsx
+  workbook_output: workbook/cashflow_current.xlsx
+
+logging:
+  level: INFO
+  format: "%(asctime)s | %(name)s | %(levelname)s | %(message)s"

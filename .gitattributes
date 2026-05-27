@@ -1,0 +1,16 @@
+# Default: auto-detect text, normalize to LF in the repo
+* text=auto eol=lf
+
+# Windows script files must use CRLF locally
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files — no line ending conversion
+*.xlsx binary
+*.xlsm binary
+*.xls binary
+*.parquet binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
