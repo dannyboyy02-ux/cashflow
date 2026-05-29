@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from src.calc.bucketing import (
+    aggregate_disbursements_by_week,
     aggregate_receipts_by_week,
     assign_forecast_week,
     monday_of_week,
@@ -189,5 +190,104 @@ def test_aggregate_with_empty_input_returns_empty():
     stamped_w = assign_forecast_week(stamped, AS_OF_FRIDAY)
 
     agg = aggregate_receipts_by_week(stamped_w, horizon_weeks=13)
+
+    assert len(agg) == 0
+
+
+# ---- AP disbursements: same grid, vendorNumber + disbursement_amount ----------
+#
+# Mirrors the AR cases above. The week-assignment core is shared via the
+# date_col parameter (expected_payment_date instead of expected_collection_date);
+# aggregate_disbursements_by_week sums the already-positive disbursement_amount.
+
+
+def _stamped_ap(*rows):
+    """Build a stamped AP DataFrame from (vendor, payment_date, amount) tuples.
+
+    disbursement_amount is positive on both AP streams (see payments_timing.py),
+    so these fixtures use positive values like the AR receipts fixtures.
+    """
+    return pd.DataFrame({
+        "vendorNumber": [r[0] for r in rows],
+        "expected_payment_date": [r[1] for r in rows],
+        "disbursement_amount": [r[2] for r in rows],
+        "was_overdue": [False] * len(rows),
+    })
+
+
+def test_ap_assign_forecast_week_basic_bucketing():
+    """AP rows bucket onto the same Monday-anchored grid via date_col."""
+    stamped = _stamped_ap(
+        ("V", dt.date(2026, 5, 29), 100.0),  # week 1
+        ("V", dt.date(2026, 6, 1),  200.0),  # week 2
+    )
+
+    out = assign_forecast_week(stamped, AS_OF_FRIDAY, date_col="expected_payment_date")
+
+    assert list(out["forecast_week"]) == [1, 2]
+    assert list(out["week_start_date"]) == [dt.date(2026, 5, 25), dt.date(2026, 6, 1)]
+
+
+def test_ap_aggregate_basic_disbursements_by_vendor_week():
+    """disbursement_amount aggregates per (vendor, week) into a 'disbursements' col."""
+    stamped = _stamped_ap(
+        ("V", dt.date(2026, 6, 1), 1000.0),
+        ("W", dt.date(2026, 6, 1), 2000.0),
+    )
+    stamped_w = assign_forecast_week(stamped, AS_OF_FRIDAY, date_col="expected_payment_date")
+
+    agg = aggregate_disbursements_by_week(stamped_w, horizon_weeks=13)
+
+    assert len(agg) == 2
+    assert "disbursements" in agg.columns
+    by_vendor = agg.set_index("vendorNumber")["disbursements"].to_dict()
+    assert by_vendor == {"V": 1000.0, "W": 2000.0}
+
+
+def test_ap_aggregate_sums_multiple_rows_per_vendor_week():
+    """Two rows for the same (vendor, week) collapse to one summed row."""
+    stamped = _stamped_ap(
+        ("V", dt.date(2026, 5, 29), 1000.0),  # week 1
+        ("V", dt.date(2026, 5, 31), 500.0),   # week 1
+        ("V", dt.date(2026, 6, 1),  2000.0),  # week 2
+    )
+    stamped_w = assign_forecast_week(stamped, AS_OF_FRIDAY, date_col="expected_payment_date")
+
+    agg = aggregate_disbursements_by_week(stamped_w, horizon_weeks=13)
+
+    v_w1 = agg[(agg["vendorNumber"] == "V") & (agg["forecast_week"] == 1)]
+    v_w2 = agg[(agg["vendorNumber"] == "V") & (agg["forecast_week"] == 2)]
+    assert len(agg) == 2
+    assert v_w1.iloc[0]["disbursements"] == pytest.approx(1500.0)
+    assert v_w2.iloc[0]["disbursements"] == pytest.approx(2000.0)
+
+
+def test_ap_aggregate_excludes_out_of_horizon_rows():
+    """AP rows beyond week 13 are dropped from the aggregate, like AR."""
+    stamped = _stamped_ap(
+        ("V", dt.date(2026, 6, 1),  1000.0),  # week 2, in horizon
+        ("V", dt.date(2026, 8, 24), 2000.0),  # week 14, out of horizon
+        ("W", dt.date(2028, 9, 13), 9999.0),  # week 121, out of horizon
+    )
+    stamped_w = assign_forecast_week(stamped, AS_OF_FRIDAY, date_col="expected_payment_date")
+
+    agg = aggregate_disbursements_by_week(stamped_w, horizon_weeks=13)
+
+    assert len(agg) == 1
+    assert agg.iloc[0]["vendorNumber"] == "V"
+    assert agg.iloc[0]["forecast_week"] == 2
+
+
+def test_ap_aggregate_with_empty_input_returns_empty():
+    """Defensive: an empty stamped AP DataFrame produces an empty aggregate."""
+    stamped = pd.DataFrame({
+        "vendorNumber": pd.Series([], dtype="string"),
+        "expected_payment_date": pd.Series([], dtype="datetime64[ns]"),
+        "disbursement_amount": pd.Series([], dtype="float64"),
+        "was_overdue": pd.Series([], dtype="bool"),
+    })
+    stamped_w = assign_forecast_week(stamped, AS_OF_FRIDAY, date_col="expected_payment_date")
+
+    agg = aggregate_disbursements_by_week(stamped_w, horizon_weeks=13)
 
     assert len(agg) == 0
