@@ -27,6 +27,7 @@ every open AR row.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from typing import Optional
 
@@ -38,10 +39,13 @@ from src.transform.due_dates import build_customer_due_days, DEFAULT_DUE_DAYS
 
 logger = logging.getLogger(__name__)
 
-# Window over which trailing sales are measured. The AR_History PA flow pulls
-# postingDate >= utcNow() - 12 months, so by construction the data covers
-# roughly 365 days; the exact day-count fluctuates by a day or two depending
-# on month lengths, but the impact on DSO is sub-percent and immaterial.
+# Window over which trailing sales are measured. Bounded on BOTH sides
+# (as_of - WINDOW_DAYS <= postingDate <= as_of) so that:
+#   - stale history pulls (if the PA filter were ever widened beyond 12mo)
+#     don't silently understate DSO by adding pre-window sales to the basis;
+#   - future-dated rows (rare on the AR side but architecturally possible --
+#     book entries, intercompany pairs) don't pollute the basis.
+# The one-sided upstream PA filter alone is not sufficient.
 WINDOW_DAYS = 365
 
 # documentTypes that count as credit sales for DSO. Payment and Refund are
@@ -57,14 +61,32 @@ METHOD_NO_BALANCE = "no_balance"
 METHOD_TERMS_FALLBACK = "terms_fallback"
 
 
-def trailing_net_sales(history: pd.DataFrame) -> pd.Series:
-    """Per-customer signed sum of Invoice + Credit Memo amounts.
+def trailing_net_sales(
+    history: pd.DataFrame,
+    as_of: Optional[dt.date] = None,
+    window_days: int = WINDOW_DAYS,
+) -> pd.Series:
+    """Per-customer signed sum of Invoice + Credit Memo amounts in window.
+
+    The window is bounded on BOTH sides:
+        as_of - window_days <= postingDate <= as_of
+
+    Lower bound: matches the upstream PA filter (12-month trailing).
+    Upper bound: defends against future-dated rows polluting the sales basis.
 
     Invoice amounts are positive, credit memos negative in BC's customer
     ledger, so plain sum nets correctly. Customers absent from the result
     have no sales activity in the window.
     """
-    sales = history[history["documentType"].isin(SALES_DOC_TYPES)]
+    if as_of is None:
+        as_of = dt.date.today()
+    window_start = as_of - dt.timedelta(days=window_days)
+
+    posting = pd.to_datetime(history["postingDate"]).dt.date
+    in_window = (posting >= window_start) & (posting <= as_of)
+    is_sale = history["documentType"].isin(SALES_DOC_TYPES)
+    sales = history[in_window & is_sale]
+
     return sales.groupby("customerNumber")["amount"].sum()
 
 
@@ -82,6 +104,7 @@ def compute_dso(
     real signal that the customer carries materially aged AR, surfaced rather
     than capped so downstream layers can decide how to treat it.
     """
+    # pd.isna handles None, pd.NA, NaN uniformly
     if balance is None or pd.isna(balance) or balance <= 0:
         return 0, METHOD_NO_BALANCE
     if trailing_sales is None or pd.isna(trailing_sales) or trailing_sales <= 0:
@@ -94,6 +117,7 @@ def build_customer_dso(
     customers: pd.DataFrame,
     history: pd.DataFrame,
     terms: pd.DataFrame,
+    as_of: Optional[dt.date] = None,
 ) -> pd.DataFrame:
     """Compute the per-customer DSO table.
 
@@ -101,7 +125,7 @@ def build_customer_dso(
     missing means zero) and the terms-based dueDays from the existing transform
     layer. Returns a DataFrame ready for SQLite.
     """
-    sales_by_cust = trailing_net_sales(history)
+    sales_by_cust = trailing_net_sales(history, as_of=as_of)
     terms_lookup = build_customer_due_days(customers, terms)
 
     rows: list[dict] = []

@@ -1,8 +1,26 @@
 """Stamp expected_collection_date on each open AR row from per-customer DSO.
 
-For each open AR entry:
+For each open AR Invoice entry:
     raw_collection_date = postingDate + customer's dso_days
     expected_collection_date = max(raw_collection_date, as_of_date)
+
+DOCUMENT-TYPE FILTER:
+
+Only Invoice rows are stamped as future receipts. Open Payments, Credit Memos,
+and Refunds are excluded because none of them represent future cash inflows:
+  - An open Payment is cash we already received but haven't applied to a
+    specific invoice yet -- it's in the bank, not in the forecast.
+  - An open Credit Memo is a reduction to what the customer owes us, not a
+    future receipt. It will get applied to a future or existing invoice.
+  - An open Refund (rare on the AR side) represents money we owe back to a
+    customer who overpaid -- a future outflow, not a receipt.
+
+Filtering at this layer keeps the bucketing aggregation honest: when the open
+payment is eventually applied to its target invoice in BC, the invoice will
+close (drop out of open AR) and the next refresh will naturally remove it
+from the forecast.
+
+OVERDUE CLAMP:
 
 The clamp to as_of_date treats overdue AR as expected imminently (within the
 current forecast week). Each row is tagged with was_overdue and days_overdue
@@ -33,6 +51,11 @@ logger = logging.getLogger(__name__)
 
 OUTPUT_TABLE = "ar_open_with_expected_collection"
 
+# documentTypes eligible for the receipts forecast. Only Invoice qualifies --
+# see module docstring for the rationale on excluding Payment, Credit Memo,
+# and Refund.
+RECEIPT_DOC_TYPES = ("Invoice",)
+
 # Method label applied when a customer appears on an AR row but isn't present
 # in bc_customer_dso (data-quality miss; the master should cover every customer
 # with open AR). In that case we fall back to the row's existing dueDays from
@@ -47,24 +70,46 @@ def stamp_expected_collection_dates(
 ) -> pd.DataFrame:
     """Stamp expected_collection_date, was_overdue, days_overdue on each AR row.
 
-    Joins the per-customer DSO (dso_days + dso_method) onto each AR row and
-    computes raw_collection_date = postingDate + dso_days. Overdue rows
-    (raw_collection_date < as_of_date) are clamped to as_of_date and tagged.
+    Filters input to RECEIPT_DOC_TYPES first (Invoice only) -- see module
+    docstring. Then joins the per-customer DSO (dso_days + dso_method) onto
+    each AR row and computes raw_collection_date = postingDate + dso_days.
+    Overdue rows (raw_collection_date < as_of_date) are clamped to as_of_date
+    and tagged.
 
     Customers in AR but missing from dso_df (rare) fall back to the row's
     dueDays, with timing_method = "master_fallback". The clamp logic still
     applies; only the source of the day count differs.
     """
+    # Receipts-eligible filter: only Invoice rows represent future cash inflows.
+    # Payment / Credit Memo / Refund rows on the open AR are economic events
+    # that don't add to the forecast and must not be timed into future weeks.
+    n_before = len(ar)
+    ar = ar[ar["documentType"].isin(RECEIPT_DOC_TYPES)].copy()
+    n_filtered = n_before - len(ar)
+    if n_filtered > 0:
+        logger.info(
+            "Filtered %d non-receipt rows (Payment/Credit Memo/Refund/blank) "
+            "from %d open AR; %d Invoice rows remain for stamping",
+            n_filtered, n_before, len(ar),
+        )
+
+    # Left-join in DSO data. Missing matches produce NaN in dso_days/dso_method.
     df = ar.merge(
         dso_df[["customerNumber", "dso_days", "dso_method"]],
         on="customerNumber",
         how="left",
     )
 
+    # Effective DSO: empirical (or terms-based) DSO from the lookup if present,
+    # otherwise fall back to the row's dueDays (already terms-based from the
+    # due-dates transform). astype(int) is safe because both sources are
+    # non-negative integer-typed.
     df["dso_days_effective"] = df["dso_days"].fillna(df["dueDays"]).astype(int)
     df["timing_method"] = df["dso_method"].fillna(METHOD_MASTER_FALLBACK)
     df = df.drop(columns=["dso_days", "dso_method"])
 
+    # Date arithmetic in pandas Timestamp space, then convert back to dt.date
+    # for SQLite storage (matches the existing pattern from stamp_due_dates).
     posting = pd.to_datetime(df["postingDate"])
     raw_collection = posting + pd.to_timedelta(df["dso_days_effective"], unit="D")
     as_of_ts = pd.Timestamp(as_of_date)
