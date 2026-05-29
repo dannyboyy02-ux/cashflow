@@ -22,7 +22,7 @@ worth knowing:
 
 The fields we keep mirror the customer master's join keys plus the AP-side
 balance field:
-  - `number`  : vendor code (e.g. "1001") that joins to vendorNumber on the AP ledger
+  - `number`  : vendor code (e.g. "VEND-A") that joins to vendorNumber on the AP ledger
   - `paymentTermsId` : GUID that joins to bc_payment_terms.id (same shared
     paymentTerms table that customers reference)
   - `balance` : the vendor's master AP balance, analog of customer balanceDue,

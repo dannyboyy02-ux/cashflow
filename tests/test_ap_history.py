@@ -17,23 +17,23 @@ SAMPLE_CSV = (
     "balancingAccountType,vendorNumber,open,dimensionSetID,currencyCode,"
     "lastModifiedDateTime,amount,debitAmount,creditAmount,"
     "amountLocalCurrency,debitAmountLocalCurrency,creditAmountLocalCurrency\n"
-    "100,100,Invoice,Inv A1,2025-09-15,A1,A1,21100,G/L Account,1001,false,"
+    "100,100,Invoice,Inv A1,2025-09-15,A1,A1,21100,G/L Account,VEND-A,false,"
     "0,,2025-09-15T10:00:00Z,-50000,0,50000,-50000,0,50000\n"
-    "101,101,Invoice,Inv A2,2026-04-01,A2,A2,21100,G/L Account,1001,true,"
+    "101,101,Invoice,Inv A2,2026-04-01,A2,A2,21100,G/L Account,VEND-A,true,"
     "0,,2026-04-01T10:00:00Z,-25000,0,25000,-25000,0,25000\n"
-    "102,102,Payment,Pmt P1,2026-01-15,P1,,21100,G/L Account,1001,false,"
+    "102,102,Payment,Pmt P1,2026-01-15,P1,,21100,G/L Account,VEND-A,false,"
     "0,,2026-01-15T10:00:00Z,50000,50000,0,50000,50000,0\n"
-    "103,103,Credit Memo,CM C1,2026-03-10,C1,,21100,G/L Account,1001,false,"
+    "103,103,Credit Memo,CM C1,2026-03-10,C1,,21100,G/L Account,VEND-A,false,"
     "0,,2026-03-10T10:00:00Z,2000,2000,0,2000,2000,0\n"
-    "104,104,Payment,Pmt P2,2026-06-01,P2,,21100,G/L Account,1002,false,"
+    "104,104,Payment,Pmt P2,2026-06-01,P2,,21100,G/L Account,VEND-B,false,"
     "0,,2026-05-28T10:00:00Z,75000,75000,0,75000,75000,0\n"
-    "105,105,Invoice,Book Inv,2028-10-28,BI,REF-2024,,G/L Account,6524,false,"
+    "105,105,Invoice,Book Inv,2028-10-28,BI,REF-2024,,G/L Account,VEND-C,false,"
     "0,,2024-10-28T10:00:00Z,-2400,0,2400,-2400,0,2400\n"
-    "106,106,Credit Memo,Book CM,2028-10-28,BCM,REF-2024,,G/L Account,6524,"
+    "106,106,Credit Memo,Book CM,2028-10-28,BCM,REF-2024,,G/L Account,VEND-C,"
     "false,0,,2024-10-28T10:00:00Z,2400,2400,0,2400,2400,0\n"
-    "107,107,,Manual JE,2026-02-15,MJ1,,21100,G/L Account,1080,false,"
+    "107,107,,Manual JE,2026-02-15,MJ1,,21100,G/L Account,VEND-E,false,"
     "0,,2026-02-15T10:00:00Z,-500,0,500,-500,0,500\n"
-    "108,108,Refund,Refund R1,2026-04-20,R1,,21100,G/L Account,1080,false,"
+    "108,108,Refund,Refund R1,2026-04-20,R1,,21100,G/L Account,VEND-E,false,"
     "0,,2026-04-20T10:00:00Z,100,100,0,100,100,0\n"
 )
 
@@ -101,7 +101,7 @@ def test_read_csv_preserves_future_dated_rows(tmp_path: Path) -> None:
     pre_sched = future_rows[future_rows["documentType"] == "Payment"]
     assert len(pre_sched) == 1
     assert pre_sched["postingDate"].iloc[0] == dt.date(2026, 6, 1)
-    assert pre_sched["vendorNumber"].iloc[0] == "1002"
+    assert pre_sched["vendorNumber"].iloc[0] == "VEND-B"
     assert pre_sched["amount"].iloc[0] == 75000
 
     book = future_rows[future_rows["postingDate"] == dt.date(2028, 10, 28)]

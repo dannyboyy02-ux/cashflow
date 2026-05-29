@@ -41,9 +41,9 @@ def _terms_df():
     return pd.DataFrame(
         {
             "id": [
-                "b10fe290-5f6a-eb11-aa81-000d3afcdb74",
-                "c17fdc51-5f6a-eb11-aa81-000d3afcdb74",
-                "caf8d2d2-5f6a-eb11-aa81-000d3afcdb74",
+                "terms-guid-net30-0000-0000-000000000001",
+                "terms-guid-net10-0000-0000-000000000002",
+                "terms-guid-onreceipt-0000-000000000003",
             ],
             "dueDateCalculation": ["30D", "10D", "1D"],
         }
@@ -53,10 +53,10 @@ def _terms_df():
 def _customers_df():
     return pd.DataFrame(
         {
-            "number": ["CUST-B", "5000-B", "3331-B", "9999-B"],
+            "number": ["CUST-A", "CUST-C", "CUST-B", "CUST-Z"],
             "paymentTermsId": [
-                "b10fe290-5f6a-eb11-aa81-000d3afcdb74",
-                "c17fdc51-5f6a-eb11-aa81-000d3afcdb74",
+                "terms-guid-net30-0000-0000-000000000001",
+                "terms-guid-net10-0000-0000-000000000002",
                 "00000000-0000-0000-0000-000000000000",
                 "deadbeef-0000-0000-0000-000000000000",
             ],
@@ -66,17 +66,17 @@ def _customers_df():
 
 def test_build_customer_due_days_resolves_and_falls_back():
     lookup = build_customer_due_days(_customers_df(), _terms_df())
-    assert lookup["CUST-B"] == 30
-    assert lookup["5000-B"] == 10
-    assert lookup["3331-B"] == DEFAULT_DUE_DAYS
-    assert lookup["9999-B"] == DEFAULT_DUE_DAYS
+    assert lookup["CUST-A"] == 30
+    assert lookup["CUST-C"] == 10
+    assert lookup["CUST-B"] == DEFAULT_DUE_DAYS
+    assert lookup["CUST-Z"] == DEFAULT_DUE_DAYS
 
 
 def test_stamp_due_dates_adds_due_date_columns():
     lookup = build_customer_due_days(_customers_df(), _terms_df())
     ar = pd.DataFrame(
         {
-            "customerNumber": ["CUST-B", "5000-B", "3331-B"],
+            "customerNumber": ["CUST-A", "CUST-C", "CUST-B"],
             "postingDate": ["2024-09-21", "2024-09-21", "2024-09-21"],
             "documentType": ["Invoice", "Invoice", "Credit Memo"],
             "amount": [1000.0, 500.0, -200.0],
@@ -94,7 +94,7 @@ def test_stamp_due_dates_adds_due_date_columns():
 
 
 def test_stamp_due_dates_defaults_unknown_customer():
-    lookup = {"CUST-B": 30}
+    lookup = {"CUST-A": 30}
     ar = pd.DataFrame(
         {"customerNumber": ["NOT-IN-MASTER"], "postingDate": ["2024-09-21"]}
     )

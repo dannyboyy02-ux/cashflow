@@ -19,7 +19,7 @@ SAMPLE_CSV = (
     "debitAmount,creditAmount,amountLocalCurrency,debitAmountLocalCurrency,"
     "creditAmountLocalCurrency\n"
     "32571394,32571394,Invoice,Invoice 215830,2023-09-24,215830,511480,11100,"
-    "G/L Account,CUST-B,true,37,,,2024-06-19T17:43:43.153Z,1806.0,1806.0,0.0,"
+    "G/L Account,CUST-A,true,37,,,2024-06-19T17:43:43.153Z,1806.0,1806.0,0.0,"
     "1806.0,1806.0,0.0\n"
 )
 
@@ -32,7 +32,7 @@ def test_read_csv_returns_dataframe_with_expected_shape(tmp_path: Path) -> None:
 
     assert len(df) == 1
     assert set(df.columns) == set(EXPECTED_COLUMNS)
-    assert df.loc[0, "customerNumber"] == "CUST-B"
+    assert df.loc[0, "customerNumber"] == "CUST-A"
     assert df.loc[0, "amount"] == 1806.0
     assert df.loc[0, "open"] == True
     assert str(df.loc[0, "postingDate"]) == "2023-09-24"

@@ -13,8 +13,8 @@ from src.transform.ap_due_dates import (
 def test_build_vendor_due_days_resolves_and_falls_back() -> None:
     """Vendors with valid terms resolve to the parsed day count; otherwise default."""
     vendors = pd.DataFrame([
-        {"number": "1001", "paymentTermsId": "terms-net30"},
-        {"number": "1002", "paymentTermsId": "terms-net15"},
+        {"number": "VEND-A", "paymentTermsId": "terms-net30"},
+        {"number": "VEND-B", "paymentTermsId": "terms-net15"},
         {"number": "4843", "paymentTermsId": "terms-unknown"},
         {"number": "1938", "paymentTermsId": ""},
     ])
@@ -26,8 +26,8 @@ def test_build_vendor_due_days_resolves_and_falls_back() -> None:
 
     lookup = build_vendor_due_days(vendors, terms)
 
-    assert lookup["1001"] == 30
-    assert lookup["1002"] == 15
+    assert lookup["VEND-A"] == 30
+    assert lookup["VEND-B"] == 15
     assert lookup["4843"] == DEFAULT_DUE_DAYS
     assert lookup["1938"] == DEFAULT_DUE_DAYS
 
@@ -52,10 +52,10 @@ def test_build_vendor_due_days_uses_default_for_calendar_relative_terms() -> Non
 def test_stamp_due_dates_adds_due_date_columns() -> None:
     """dueDate = postingDate + dueDays for each open AP entry."""
     ap = pd.DataFrame([
-        {"vendorNumber": "1001", "postingDate": "2026-05-01", "amount": -1000.0},
-        {"vendorNumber": "1002", "postingDate": "2026-04-15", "amount": -5000.0},
+        {"vendorNumber": "VEND-A", "postingDate": "2026-05-01", "amount": -1000.0},
+        {"vendorNumber": "VEND-B", "postingDate": "2026-04-15", "amount": -5000.0},
     ])
-    lookup = {"1001": 30, "1002": 15}
+    lookup = {"VEND-A": 30, "VEND-B": 15}
 
     stamped = stamp_due_dates(ap, lookup)
 
@@ -71,7 +71,7 @@ def test_stamp_due_dates_defaults_unknown_vendor() -> None:
     ap = pd.DataFrame([
         {"vendorNumber": "99999", "postingDate": "2026-05-01", "amount": -1000.0},
     ])
-    lookup = {"1001": 30}
+    lookup = {"VEND-A": 30}
 
     stamped = stamp_due_dates(ap, lookup)
 
@@ -82,14 +82,14 @@ def test_stamp_due_dates_defaults_unknown_vendor() -> None:
 def test_stamp_due_dates_sign_convention_agnostic() -> None:
     """Due-date stamping works for all AP document types regardless of amount sign."""
     ap = pd.DataFrame([
-        {"vendorNumber": "1001", "postingDate": "2026-05-01", "amount": -1000.0,
+        {"vendorNumber": "VEND-A", "postingDate": "2026-05-01", "amount": -1000.0,
          "documentType": "Invoice"},
-        {"vendorNumber": "1001", "postingDate": "2026-05-01", "amount": 500.0,
+        {"vendorNumber": "VEND-A", "postingDate": "2026-05-01", "amount": 500.0,
          "documentType": "Payment"},
-        {"vendorNumber": "1001", "postingDate": "2026-05-01", "amount": 250.0,
+        {"vendorNumber": "VEND-A", "postingDate": "2026-05-01", "amount": 250.0,
          "documentType": "Credit Memo"},
     ])
-    lookup = {"1001": 30}
+    lookup = {"VEND-A": 30}
 
     stamped = stamp_due_dates(ap, lookup)
 

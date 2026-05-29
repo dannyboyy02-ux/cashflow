@@ -16,11 +16,11 @@ SAMPLE_CSV = (
     "@odata.etag,ItemInternalId,id,code,displayName,dueDateCalculation,"
     "discountDateCalculation,discountPercent,calculateDiscountOnCreditMemos,"
     "lastModifiedDateTime\n"
-    'W/"Jz04",pt000004,b10fe290-5f6a-eb11-aa81-000d3afcdb74,NET30,Net 30 Days,30D,,0,'
+    'W/"Jz04",pt000004,terms-guid-net30-0000-0000-000000000001,NET30,Net 30 Days,30D,,0,'
     "FALSE,2021-02-08T22:48:56.650Z\n"
-    'W/"Jz05",pt000005,caf8d2d2-5f6a-eb11-aa81-000d3afcdb74,ON RECPT,Due upon receipt,1D,,0,'
+    'W/"Jz05",pt000005,terms-guid-onreceipt-0000-000000000003,ON RECPT,Due upon receipt,1D,,0,'
     "FALSE,2021-02-08T22:49:06.927Z\n"
-    'W/"Jz02",pt000002,c17fdc51-5f6a-eb11-aa81-000d3afcdb74,NET10,Net 10 Days,10D,,0,'
+    'W/"Jz02",pt000002,terms-guid-net10-0000-0000-000000000002,NET10,Net 10 Days,10D,,0,'
     "FALSE,2021-02-08T22:45:35.027Z\n"
 )
 

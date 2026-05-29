@@ -21,12 +21,12 @@ SAMPLE_CSV = (
     "taxAreaDisplayName,taxRegistrationNumber,currencyId,currencyCode,"
     "paymentTermsId,shipmentMethodId,paymentMethodId,blocked@odata.type,blocked,"
     "lastModifiedDateTime\n"
-    'W/"JzIw",aaaa1111,11110000-1111-2222-3333-444455556666,CUST-B,Acme Foods,'
-    "#Microsoft.NAV.customerType,Company,1 Main St,,Columbus,OH,US,43004,,,,SP1,"
-    "15000.50,50000,true,,,,,USD,b10fe290-5f6a-eb11-aa81-000d3afcdb74,,,"
+    'W/"JzIw",aaaa1111,11110000-1111-2222-3333-444455556666,CUST-A,Example Customer A,'
+    "#Microsoft.NAV.customerType,Company,100 Example St,,SAMPLE CITY,OH,US,43004,,,,SP1,"
+    "15000.50,50000,true,,,,,USD,terms-guid-net30-0000-0000-000000000001,,,"
     "#Microsoft.NAV.blocked, ,2026-01-16T17:34:06.047Z\n"
-    'W/"JzIx",bbbb2222,22220000-1111-2222-3333-444455556666,3331-B,Blank Terms Co,'
-    "#Microsoft.NAV.customerType,Company,2 Oak Ave,,Plant 3,CA,US,93901,,,,SP2,0,"
+    'W/"JzIx",bbbb2222,22220000-1111-2222-3333-444455556666,CUST-B,Example Customer B,'
+    "#Microsoft.NAV.customerType,Company,200 Sample Ave,,TESTVILLE,CA,US,93901,,,,SP2,0,"
     "25000,true,,,,,USD,00000000-0000-0000-0000-000000000000,,,"
     "#Microsoft.NAV.blocked, ,2026-02-08T22:48:56.650Z\n"
 )
@@ -50,8 +50,8 @@ def test_read_csv_parses_types_and_rows(tmp_path: Path) -> None:
     df = read_csv(csv_path)
 
     assert len(df) == 2
-    assert df.loc[0, "number"] == "CUST-B"
-    assert df.loc[0, "paymentTermsId"] == "b10fe290-5f6a-eb11-aa81-000d3afcdb74"
+    assert df.loc[0, "number"] == "CUST-A"
+    assert df.loc[0, "paymentTermsId"] == "terms-guid-net30-0000-0000-000000000001"
     assert df.loc[0, "balanceDue"] == 15000.50
     assert df.loc[1, "paymentTermsId"] == "00000000-0000-0000-0000-000000000000"
 

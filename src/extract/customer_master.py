@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Columns we keep, mapped to pandas dtypes. Everything else in the CSV
 # (@odata.etag, ItemInternalId, type@odata.type, type, address/contact fields,
 # tax fields, shipment/payment method, blocked@odata.type) is intentionally
-# dropped via usecols. `number` is the customer code (e.g. "CUST-B") that joins
+# dropped via usecols. `number` is the customer code (e.g. "CUST-A") that joins
 # to customerNumber on the AR ledger. `paymentTermsId` is the GUID that joins to
 # bc_payment_terms.id for due-date derivation.
 EXPECTED_COLUMNS = {

@@ -16,18 +16,18 @@ SAMPLE_CSV = (
     "website,taxRegistrationNumber,currencyId,currencyCode,irs1099Code,"
     "paymentTermsId,paymentMethodId,taxLiable,blocked@odata.type,blocked,"
     "balance,lastModifiedDateTime\n"
-    'etag1,internal1,abc-1,1026,Grainger,,,PALATINE,IL,US,60067,,,,,'
+    'etag1,internal1,abc-1,1026,Example Vendor A,,,TESTVILLE,IL,US,60067,,,,,'
     "00000000-0000-0000-0000-000000000000,USD,EXEMPT,terms-net30,methodA,"
     "True,#Microsoft.NAV.vendorBlocked,_x0020_,3038.49,2025-02-26T21:16:50.103Z\n"
-    'etag2,internal2,abc-2,1047,DazPak,19310 San Jose Ave,,City Of Industry,'
+    'etag2,internal2,abc-2,1047,Example Vendor B,300 Fixture Rd,,EXAMPLE CITY,'
     "CA,US,91748,,,,,00000000-0000-0000-0000-000000000000,USD,EXEMPT,"
     "terms-net30,methodA,True,#Microsoft.NAV.vendorBlocked,All,47008.42,"
     "2026-02-04T19:18:57.853Z\n"
-    'etag3,internal3,abc-3,1001,BigSupplier,,,Chicago,IL,US,60601,,,,,'
+    'etag3,internal3,abc-3,VEND-A,Example Vendor C,,,TEST CITY,IL,US,60601,,,,,'
     "00000000-0000-0000-0000-000000000000,USD,NEC-01,terms-net15,methodB,"
     "True,#Microsoft.NAV.vendorBlocked,Payment,7215282.00,"
     "2026-05-28T10:00:00.000Z\n"
-    'etag4,internal4,abc-4,5686,SmallVendor,,,Atlanta,GA,US,30309,,,,,'
+    'etag4,internal4,abc-4,VEND-D,Example Vendor D,,,SAMPLE CITY,GA,US,30309,,,,,'
     "00000000-0000-0000-0000-000000000000,USD,EXEMPT,terms-net30,methodA,"
     "True,#Microsoft.NAV.vendorBlocked,_x0020_,-73516.00,"
     "2026-05-20T08:00:00.000Z\n"
@@ -59,7 +59,7 @@ def test_read_csv_parses_types_and_rows(tmp_path: Path) -> None:
 
     assert len(df) == 4
     assert df["number"].iloc[0] == "1026"
-    assert df["displayName"].iloc[0] == "Grainger"
+    assert df["displayName"].iloc[0] == "Example Vendor A"
     assert df["balance"].iloc[0] == 3038.49
     assert df["balance"].iloc[3] == -73516.00
     assert pd.api.types.is_datetime64_any_dtype(df["lastModifiedDateTime"])
@@ -77,9 +77,9 @@ def test_read_csv_normalizes_x0020_blocked_to_na(tmp_path: Path) -> None:
     df = read_csv(csv_path)
 
     assert pd.isna(df.loc[df["number"] == "1026", "blocked"].iloc[0])
-    assert pd.isna(df.loc[df["number"] == "5686", "blocked"].iloc[0])
+    assert pd.isna(df.loc[df["number"] == "VEND-D", "blocked"].iloc[0])
     assert df.loc[df["number"] == "1047", "blocked"].iloc[0] == "All"
-    assert df.loc[df["number"] == "1001", "blocked"].iloc[0] == "Payment"
+    assert df.loc[df["number"] == "VEND-A", "blocked"].iloc[0] == "Payment"
     assert df["blocked"].isna().sum() == 2
     assert df["blocked"].notna().sum() == 2
 
