@@ -261,3 +261,8 @@ def run(
 
 if __name__ == "__main__":
     run()
+    # Pipeline wiring: after bucketing writes the week tables, capture a dated
+    # snapshot of them for day-over-day variance. Done here in __main__ (not
+    # inside run()) so programmatic callers of run() stay side-effect-free.
+    from src.calc import snapshot
+    snapshot.run()
