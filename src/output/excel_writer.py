@@ -76,8 +76,12 @@ VARIANCE_PLACEHOLDER = (
 
 # Currency, no decimals, $ prefix, negatives in red parentheses, zeros as a dash.
 CURRENCY_FMT = "$#,##0_);[Red]($#,##0);-"
-# Delta cells: positive green, negative red (parentheses), zero dash.
+# Delta cells, favorable: positive green, negative red (parens), zero dash.
+# Used for AR Δ and Net Δ, where an increase is good for cash.
 DELTA_FMT = "[Green]$#,##0;[Red]($#,##0);-"
+# Delta cells, unfavorable: colors flipped (positive red, negative green). Used
+# for AP Δ, where an INCREASE in disbursements means more cash out -- bad.
+DELTA_FMT_UNFAVORABLE = "[Red]$#,##0;[Green]($#,##0);-"
 DATE_FMT = "yyyy-mm-dd"
 
 # Professional, consistent font across the workbook (xlsx skill requirement).
@@ -165,8 +169,8 @@ def _money(cell, font: Font = F_BASE) -> None:
     cell.font = font
 
 
-def _delta(cell, font: Font = F_BASE) -> None:
-    cell.number_format = DELTA_FMT
+def _delta(cell, font: Font = F_BASE, fmt: str = DELTA_FMT) -> None:
+    cell.number_format = fmt
     cell.font = font
 
 
@@ -407,7 +411,8 @@ def _build_variance_sheet(
         _delta(ws.cell(row=r, column=5, value=f"=C{r}-D{r}"))   # AR delta
         _money(ws.cell(row=r, column=6, value=apt))   # AP Today
         _money(ws.cell(row=r, column=7, value=app))   # AP Prior
-        _delta(ws.cell(row=r, column=8, value=f"=F{r}-G{r}"))   # AP delta
+        # AP delta uses the unfavorable format: a rise in disbursements is bad.
+        _delta(ws.cell(row=r, column=8, value=f"=F{r}-G{r}"), fmt=DELTA_FMT_UNFAVORABLE)
         _money(ws.cell(row=r, column=9, value=f"=C{r}-F{r}"))   # Net Today
         _money(ws.cell(row=r, column=10, value=f"=D{r}-G{r}"))  # Net Prior
         _delta(ws.cell(row=r, column=11, value=f"=I{r}-J{r}"))  # Net delta
@@ -418,7 +423,9 @@ def _build_variance_sheet(
     for col in range(3, 12):
         letter = get_column_letter(col)
         cell = ws.cell(row=tr, column=col, value=f"=SUM({letter}2:{letter}{last_data_row})")
-        if col in (5, 8, 11):
+        if col == 8:  # AP Δ total: unfavorable coloring
+            _delta(cell, F_HEADER, fmt=DELTA_FMT_UNFAVORABLE)
+        elif col in (5, 11):  # AR Δ / Net Δ totals: favorable coloring
             _delta(cell, F_HEADER)
         else:
             _money(cell, F_HEADER)

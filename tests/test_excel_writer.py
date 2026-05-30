@@ -21,6 +21,7 @@ from openpyxl import load_workbook
 from src.output.excel_writer import (
     CURRENCY_FMT,
     DELTA_FMT,
+    DELTA_FMT_UNFAVORABLE,
     OUTPUT_FILENAME,
     SHEET_AP,
     SHEET_AR,
@@ -434,11 +435,25 @@ def test_variance_delta_columns_are_formulas_with_delta_format(tmp_path):
     assert ws.cell(row=2, column=5).value == "=C2-D2"
     assert ws.cell(row=2, column=8).value == "=F2-G2"
     assert ws.cell(row=2, column=11).value == "=I2-J2"
+    # AR Δ (E) and Net Δ (K) use favorable coloring (positive green).
     assert ws.cell(row=2, column=5).number_format == DELTA_FMT
     assert ws.cell(row=2, column=11).number_format == DELTA_FMT
     # Net today/prior are also formulas.
     assert ws.cell(row=2, column=9).value == "=C2-F2"
     assert ws.cell(row=2, column=10).value == "=D2-G2"
+
+
+def test_variance_ap_delta_uses_unfavorable_format(tmp_path):
+    """AP Δ (column H) is red-for-positive: a rise in disbursements is bad."""
+    wb = _build_with_variance(tmp_path, _variance())
+    ws = wb[SHEET_VARIANCE]
+
+    assert DELTA_FMT_UNFAVORABLE == "[Red]$#,##0;[Green]($#,##0);-"
+    assert ws.cell(row=2, column=8).number_format == DELTA_FMT_UNFAVORABLE   # data row
+    assert ws.cell(row=15, column=8).number_format == DELTA_FMT_UNFAVORABLE  # totals
+    # AR Δ and Net Δ remain favorable, distinct from AP Δ.
+    assert ws.cell(row=2, column=5).number_format == DELTA_FMT
+    assert ws.cell(row=2, column=11).number_format == DELTA_FMT
 
 
 def test_variance_today_prior_source_values(tmp_path):
