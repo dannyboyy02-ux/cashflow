@@ -10,18 +10,27 @@ customer/vendor masters for display names, and writes four sheets:
   3. "AP by Vendor"       -- disbursements pivoted to vendor x week
   4. "Assumptions & Notes"-- as-of date, refresh stamp, methodology, caveats
 
-FORMULAS vs VALUES:
+FORMULAS, NOT HARDCODED VALUES (per the xlsx skill standard):
 
-The model's outputs -- AR Receipts, AP Disbursements, Net Cash Flow, and the
-totals row -- are written as computed VALUES. They are facts produced by the
-calc layer; there's nothing for Excel to recompute.
+The workbook is fully live. The only hardcoded numbers are the per-(entity,week)
+cash figures on the AR/AP detail sheets (the model's source facts) and the
+week-1 Beginning Cash input. Everything else is an Excel formula:
 
-The Beginning/Ending cash chain is the one place we use live Excel formulas,
-because it depends on a number the model does NOT know: the actual bank balance
-at the start of week 1. The CFO hand-enters that into the Beginning Cash cell
-of week 1; each week's Ending Cash = Beginning + Net Cash Flow, and the next
-week's Beginning Cash = the prior week's Ending. Editing the one starting
-balance cascades the whole 13-week cash position.
+  - Forecast AR Receipts / AP Disbursements  -> cross-sheet =SUM links into the
+    matching week column of the AR/AP detail sheets (green text: links).
+  - Forecast Net Cash Flow                   -> =Receipts - Disbursements.
+  - Forecast totals row                      -> =SUM down each column.
+  - Detail-sheet Total column                -> =SUM across the 13 week columns.
+  - Ending Cash = Beginning + Net; next week's Beginning = prior Ending, so the
+    CFO's one starting-balance entry cascades through the whole horizon.
+
+Color coding follows industry/skill convention: blue = hardcoded input (the
+week-1 Beginning Cash, on a yellow "needs attention" fill), green = cross-sheet
+link, black = same-sheet formula or source value.
+
+Because openpyxl writes formulas as strings without evaluating them, run the
+xlsx skill's scripts/recalc.py (LibreOffice) on the output to cache values and
+scan for formula errors; Excel also recalculates them on open.
 """
 from __future__ import annotations
 
@@ -59,13 +68,20 @@ SHEET_AR = "AR by Customer"
 SHEET_AP = "AP by Vendor"
 SHEET_NOTES = "Assumptions & Notes"
 
-# Currency, no decimals, negatives in red parentheses.
-CURRENCY_FMT = "#,##0_);[Red](#,##0)"
+# Currency, no decimals, $ prefix, negatives in red parentheses, zeros as a dash.
+CURRENCY_FMT = "$#,##0_);[Red]($#,##0);-"
 DATE_FMT = "yyyy-mm-dd"
 
-_HEADER_FONT = Font(bold=True)
-_HEADER_FILL = PatternFill(fill_type="solid", fgColor="D9D9D9")  # light gray
-_TITLE_FONT = Font(bold=True, size=14)
+# Professional, consistent font across the workbook (xlsx skill requirement).
+FONT_NAME = "Arial"
+F_BASE = Font(name=FONT_NAME)
+F_HEADER = Font(name=FONT_NAME, bold=True)
+F_TITLE = Font(name=FONT_NAME, bold=True, size=14)
+F_INPUT = Font(name=FONT_NAME, color="0000FF")   # blue: hardcoded input
+F_LINK = Font(name=FONT_NAME, color="008000")    # green: cross-sheet link
+
+_HEADER_FILL = PatternFill(fill_type="solid", fgColor="D9D9D9")   # light gray
+_INPUT_FILL = PatternFill(fill_type="solid", fgColor="FFFF00")    # yellow: attention
 
 
 # ---------------------------------------------------------------------------
@@ -115,13 +131,14 @@ def _style_header_row(ws: Worksheet, n_cols: int, row: int = 1) -> None:
     """Bold + light-gray fill across the first n_cols cells of a header row."""
     for c in range(1, n_cols + 1):
         cell = ws.cell(row=row, column=c)
-        cell.font = _HEADER_FONT
+        cell.font = F_HEADER
         cell.fill = _HEADER_FILL
         cell.alignment = Alignment(horizontal="center")
 
 
-def _currency(cell) -> None:
+def _money(cell, font: Font = F_BASE) -> None:
     cell.number_format = CURRENCY_FMT
+    cell.font = font
 
 
 def _wk_sums(df: pd.DataFrame, value_col: str) -> dict[int, float]:
@@ -138,11 +155,19 @@ def _wk_sums(df: pd.DataFrame, value_col: str) -> dict[int, float]:
 
 def _build_forecast_sheet(
     ws: Worksheet,
-    receipts: pd.DataFrame,
-    disbursements: pd.DataFrame,
     as_of_date: dt.date,
     horizon_weeks: int,
+    ar_data_rows: int,
+    ap_data_rows: int,
 ) -> None:
+    """Headline forecast. AR/AP columns are cross-sheet =SUM links; net, ending
+    cash, and totals are formulas. Only week-1 Beginning Cash is a hardcoded
+    (CFO-entered) input.
+
+    ar_data_rows / ap_data_rows are the count of detail rows on the AR/AP sheets,
+    used to build the cross-sheet SUM ranges. A count of 0 collapses to an empty
+    one-cell range (row 2) that sums to zero.
+    """
     headers = [
         "Forecast Week",
         "Week Start",
@@ -156,50 +181,53 @@ def _build_forecast_sheet(
     _style_header_row(ws, len(headers))
 
     week_1_monday = monday_of_week(as_of_date)
-    rec = _wk_sums(receipts, "receipts")
-    dis = _wk_sums(disbursements, "disbursements")
+    ar_last = 1 + ar_data_rows if ar_data_rows > 0 else 2
+    ap_last = 1 + ap_data_rows if ap_data_rows > 0 else 2
 
-    tot_rec = tot_dis = tot_net = 0.0
     for i in range(horizon_weeks):
         wk = i + 1
         r = i + 2  # worksheet row (1 = header)
         week_start = week_1_monday + dt.timedelta(days=7 * i)
-        rec_v = float(rec.get(wk, 0.0))
-        dis_v = float(dis.get(wk, 0.0))
-        net_v = rec_v - dis_v
-        tot_rec += rec_v
-        tot_dis += dis_v
-        tot_net += net_v
 
-        ws.cell(row=r, column=1, value=wk)
+        ws.cell(row=r, column=1, value=wk).font = F_BASE
         date_cell = ws.cell(row=r, column=2, value=week_start)
         date_cell.number_format = DATE_FMT
-        # Beginning Cash: week 1 is the CFO's hand-entered starting balance
-        # (0 placeholder); later weeks chain off the prior week's Ending Cash.
-        if wk == 1:
-            begin_cell = ws.cell(row=r, column=3, value=0)
-        else:
-            begin_cell = ws.cell(row=r, column=3, value=f"=G{r - 1}")
-        ws.cell(row=r, column=4, value=rec_v)
-        ws.cell(row=r, column=5, value=dis_v)
-        ws.cell(row=r, column=6, value=net_v)
-        # Ending Cash = Beginning + Net (live formula so the CFO's starting
-        # balance cascades forward through the horizon).
-        end_cell = ws.cell(row=r, column=7, value=f"=C{r}+F{r}")
+        date_cell.font = F_BASE
 
-        for col in (3, 4, 5, 6, 7):
-            _currency(ws.cell(row=r, column=col))
+        # Beginning Cash: week 1 is the CFO's hand-entered starting balance
+        # (0 placeholder, blue text on yellow fill); later weeks chain off the
+        # prior week's Ending Cash.
+        if wk == 1:
+            begin = ws.cell(row=r, column=3, value=0)
+            begin.fill = _INPUT_FILL
+            _money(begin, F_INPUT)
+        else:
+            _money(ws.cell(row=r, column=3, value=f"=G{r - 1}"))
+
+        # AR Receipts / AP Disbursements: cross-sheet SUM of the matching week
+        # column on the detail sheets (green = link).
+        ar_col = get_column_letter(2 + wk)   # detail Week N is col 2+N (C..O)
+        ap_col = get_column_letter(2 + wk)
+        _money(
+            ws.cell(row=r, column=4, value=f"=SUM('{SHEET_AR}'!{ar_col}2:{ar_col}{ar_last})"),
+            F_LINK,
+        )
+        _money(
+            ws.cell(row=r, column=5, value=f"=SUM('{SHEET_AP}'!{ap_col}2:{ap_col}{ap_last})"),
+            F_LINK,
+        )
+        # Net Cash Flow and Ending Cash: same-sheet formulas (black).
+        _money(ws.cell(row=r, column=6, value=f"=D{r}-E{r}"))
+        _money(ws.cell(row=r, column=7, value=f"=C{r}+F{r}"))
 
     # Totals row.
     tr = horizon_weeks + 2
-    ws.cell(row=tr, column=1, value="TOTAL").font = _HEADER_FONT
-    ws.cell(row=tr, column=4, value=tot_rec)
-    ws.cell(row=tr, column=5, value=tot_dis)
-    ws.cell(row=tr, column=6, value=tot_net)
+    last_data_row = horizon_weeks + 1
+    ws.cell(row=tr, column=1, value="TOTAL").font = F_HEADER
     for col in (4, 5, 6):
-        cell = ws.cell(row=tr, column=col)
-        _currency(cell)
-        cell.font = _HEADER_FONT
+        letter = get_column_letter(col)
+        cell = ws.cell(row=tr, column=col, value=f"=SUM({letter}2:{letter}{last_data_row})")
+        _money(cell, F_HEADER)
 
     ws.freeze_panes = "A2"
     _set_widths(ws, {"A": 14, "B": 12, "C": 16, "D": 16, "E": 18, "F": 16, "G": 16})
@@ -219,10 +247,11 @@ def _build_entity_sheet(
     number_header: str,
     name_header: str,
     horizon_weeks: int,
-) -> None:
+) -> int:
     """One row per entity with any in-horizon cash, weeks across, sorted by Total.
 
-    Generic for both AR (customer/receipts) and AP (vendor/disbursements).
+    Week values are the model's source numbers; the Total column is a live
+    =SUM across the 13 week columns. Returns the number of data rows written.
     """
     headers = (
         [number_header, name_header]
@@ -235,6 +264,13 @@ def _build_entity_sheet(
     name_map: dict = {}
     if not master.empty and "number" in master.columns and "displayName" in master.columns:
         name_map = dict(zip(master["number"], master["displayName"]))
+
+    n_rows = 0
+    first_week_col = 3                       # column C
+    last_week_col = 2 + horizon_weeks        # column O for 13 weeks
+    total_col = last_week_col + 1            # column P
+    first_letter = get_column_letter(first_week_col)
+    last_letter = get_column_letter(last_week_col)
 
     if not df.empty and "forecast_week" in df.columns:
         pivot = df.pivot_table(
@@ -253,22 +289,29 @@ def _build_entity_sheet(
             built.append((ent, name_map.get(ent, ""), week_vals, sum(week_vals)))
         built.sort(key=lambda x: x[3], reverse=True)
 
-        for ent, name, week_vals, total in built:
-            row = [ent, name] + week_vals + [total]
-            ws.append(row)
-
-        # Currency-format the numeric columns (3 .. last) on every data row.
-        last_col = len(headers)
-        for r in range(2, ws.max_row + 1):
-            for c in range(3, last_col + 1):
-                _currency(ws.cell(row=r, column=c))
+        for ent, name, week_vals, _total in built:
+            r = ws.max_row + 1
+            ws.cell(row=r, column=1, value=ent).font = F_BASE
+            ws.cell(row=r, column=2, value=name).font = F_BASE
+            for j, v in enumerate(week_vals):
+                _money(ws.cell(row=r, column=first_week_col + j, value=v))
+            # Total column: live SUM across the week cells.
+            _money(
+                ws.cell(
+                    row=r,
+                    column=total_col,
+                    value=f"=SUM({first_letter}{r}:{last_letter}{r})",
+                )
+            )
+            n_rows += 1
 
     ws.freeze_panes = "C2"  # keep number + name + header visible while scrolling
     widths = {"A": 16, "B": 32}
     for w in range(1, horizon_weeks + 1):
         widths[get_column_letter(2 + w)] = 12
-    widths[get_column_letter(2 + horizon_weeks + 1)] = 16  # Total
+    widths[get_column_letter(total_col)] = 16
     _set_widths(ws, widths)
+    return n_rows
 
 
 # ---------------------------------------------------------------------------
@@ -336,8 +379,12 @@ def _build_assumptions_sheet(
     ]
     for i, (text, is_header) in enumerate(lines, start=1):
         cell = ws.cell(row=i, column=1, value=text)
-        if is_header:
-            cell.font = _TITLE_FONT if i == 1 else _HEADER_FONT
+        if i == 1:
+            cell.font = F_TITLE
+        elif is_header:
+            cell.font = F_HEADER
+        else:
+            cell.font = F_BASE
     ws.column_dimensions["A"].width = 100
 
 
@@ -360,25 +407,27 @@ def build_workbook(
     refresh_ts: Optional[dt.datetime] = None,
     horizon_weeks: int = FORECAST_HORIZON_WEEKS,
 ) -> Workbook:
-    """Build the four-sheet forecast workbook from the bucketed inputs."""
+    """Build the four-sheet forecast workbook from the bucketed inputs.
+
+    The detail sheets are built first so the forecast sheet can size its
+    cross-sheet SUM ranges to the actual entity row counts.
+    """
     wb = Workbook()
     ws1 = wb.active
     ws1.title = SHEET_FORECAST
-    _build_forecast_sheet(ws1, receipts, disbursements, as_of_date, horizon_weeks)
-
     ws2 = wb.create_sheet(SHEET_AR)
-    _build_entity_sheet(
+    ws3 = wb.create_sheet(SHEET_AP)
+    ws4 = wb.create_sheet(SHEET_NOTES)
+
+    n_cust = _build_entity_sheet(
         ws2, receipts, customers, "customerNumber", "receipts",
         "Customer Number", "Customer Name", horizon_weeks,
     )
-
-    ws3 = wb.create_sheet(SHEET_AP)
-    _build_entity_sheet(
+    n_vend = _build_entity_sheet(
         ws3, disbursements, vendors, "vendorNumber", "disbursements",
         "Vendor Number", "Vendor Name", horizon_weeks,
     )
-
-    ws4 = wb.create_sheet(SHEET_NOTES)
+    _build_forecast_sheet(ws1, as_of_date, horizon_weeks, n_cust, n_vend)
     _build_assumptions_sheet(ws4, as_of_date, refresh_ts)
 
     return wb
