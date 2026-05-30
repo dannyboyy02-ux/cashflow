@@ -64,12 +64,20 @@ logger = logging.getLogger(__name__)
 OUTPUT_FILENAME = "cashflow_forecast.xlsx"
 
 SHEET_FORECAST = "13-Week Forecast"
+SHEET_VARIANCE = "Variance"
 SHEET_AR = "AR by Customer"
 SHEET_AP = "AP by Vendor"
 SHEET_NOTES = "Assumptions & Notes"
 
+VARIANCE_PLACEHOLDER = (
+    "No prior forecast available for comparison. "
+    "Variance will appear after the next refresh."
+)
+
 # Currency, no decimals, $ prefix, negatives in red parentheses, zeros as a dash.
 CURRENCY_FMT = "$#,##0_);[Red]($#,##0);-"
+# Delta cells: positive green, negative red (parentheses), zero dash.
+DELTA_FMT = "[Green]$#,##0;[Red]($#,##0);-"
 DATE_FMT = "yyyy-mm-dd"
 
 # Professional, consistent font across the workbook (xlsx skill requirement).
@@ -95,13 +103,29 @@ def load_table(name: str) -> pd.DataFrame:
         return pd.read_sql(f"SELECT * FROM {name}", conn)
 
 
+def _load_optional(name: str) -> pd.DataFrame:
+    """Read a table, or return an empty frame if it doesn't exist yet."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        )
+        if cur.fetchone() is None:
+            return pd.DataFrame()
+        return pd.read_sql(f"SELECT * FROM {name}", conn)
+
+
 def load_inputs() -> dict[str, pd.DataFrame]:
-    """Load the four source tables the writer needs."""
+    """Load the source tables the writer needs.
+
+    forecast_variance is optional: it doesn't exist until variance.run() has had
+    two snapshots to compare, so it's read defensively (empty -> placeholder).
+    """
     return {
         "receipts": load_table(AR_OUTPUT_TABLE),
         "disbursements": load_table(AP_OUTPUT_TABLE),
         "customers": load_table("bc_customers"),
         "vendors": load_table("bc_vendors"),
+        "variance": _load_optional("forecast_variance"),
     }
 
 
@@ -139,6 +163,21 @@ def _style_header_row(ws: Worksheet, n_cols: int, row: int = 1) -> None:
 def _money(cell, font: Font = F_BASE) -> None:
     cell.number_format = CURRENCY_FMT
     cell.font = font
+
+
+def _delta(cell, font: Font = F_BASE) -> None:
+    cell.number_format = DELTA_FMT
+    cell.font = font
+
+
+def _coerce_date(v):
+    """Best-effort convert a stored date string to a dt.date for an Excel cell."""
+    if isinstance(v, (dt.date, dt.datetime)):
+        return v
+    try:
+        return dt.date.fromisoformat(str(v)[:10])
+    except (TypeError, ValueError):
+        return v
 
 
 def _wk_sums(df: pd.DataFrame, value_col: str) -> dict[int, float]:
@@ -315,6 +354,83 @@ def _build_entity_sheet(
 
 
 # ---------------------------------------------------------------------------
+# Variance sheet -- today vs prior snapshot (week level)
+# ---------------------------------------------------------------------------
+
+
+def _build_variance_sheet(
+    ws: Worksheet,
+    variance: Optional[pd.DataFrame],
+    horizon_weeks: int,
+) -> None:
+    """Week-level day-over-day variance. AR/AP today/prior are values; deltas and
+    net rows are formulas. Delta columns use the green/red delta format.
+
+    When there is no prior snapshot (variance empty/None), writes a single
+    placeholder cell and leaves the rest of the sheet blank.
+    """
+    if variance is None or len(variance) == 0:
+        cell = ws.cell(row=1, column=1, value=VARIANCE_PLACEHOLDER)
+        cell.font = F_BASE
+        ws.column_dimensions["A"].width = 80
+        return
+
+    headers = [
+        "Forecast Week", "Week Start",
+        "AR Today", "AR Prior", "AR Δ",
+        "AP Today", "AP Prior", "AP Δ",
+        "Net Today", "Net Prior", "Net Δ",
+    ]
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+
+    by_week = {int(r["forecast_week"]): r for _, r in variance.iterrows()}
+
+    for i in range(horizon_weeks):
+        wk = i + 1
+        r = i + 2
+        row = by_week.get(wk)
+
+        ws.cell(row=r, column=1, value=wk).font = F_BASE
+        if row is not None and row["week_start_date"] is not None:
+            dcell = ws.cell(row=r, column=2, value=_coerce_date(row["week_start_date"]))
+            dcell.number_format = DATE_FMT
+            dcell.font = F_BASE
+
+        art = float(row["ar_receipts_today"]) if row is not None else 0.0
+        arp = float(row["ar_receipts_prior"]) if row is not None else 0.0
+        apt = float(row["ap_disbursements_today"]) if row is not None else 0.0
+        app = float(row["ap_disbursements_prior"]) if row is not None else 0.0
+
+        _money(ws.cell(row=r, column=3, value=art))   # AR Today
+        _money(ws.cell(row=r, column=4, value=arp))   # AR Prior
+        _delta(ws.cell(row=r, column=5, value=f"=C{r}-D{r}"))   # AR delta
+        _money(ws.cell(row=r, column=6, value=apt))   # AP Today
+        _money(ws.cell(row=r, column=7, value=app))   # AP Prior
+        _delta(ws.cell(row=r, column=8, value=f"=F{r}-G{r}"))   # AP delta
+        _money(ws.cell(row=r, column=9, value=f"=C{r}-F{r}"))   # Net Today
+        _money(ws.cell(row=r, column=10, value=f"=D{r}-G{r}"))  # Net Prior
+        _delta(ws.cell(row=r, column=11, value=f"=I{r}-J{r}"))  # Net delta
+
+    tr = horizon_weeks + 2
+    last_data_row = horizon_weeks + 1
+    ws.cell(row=tr, column=1, value="TOTAL").font = F_HEADER
+    for col in range(3, 12):
+        letter = get_column_letter(col)
+        cell = ws.cell(row=tr, column=col, value=f"=SUM({letter}2:{letter}{last_data_row})")
+        if col in (5, 8, 11):
+            _delta(cell, F_HEADER)
+        else:
+            _money(cell, F_HEADER)
+
+    ws.freeze_panes = "C2"
+    widths = {"A": 14, "B": 12}
+    for c in range(3, 12):
+        widths[get_column_letter(c)] = 14
+    _set_widths(ws, widths)
+
+
+# ---------------------------------------------------------------------------
 # Sheet 4 -- Assumptions & Notes
 # ---------------------------------------------------------------------------
 
@@ -405,30 +521,34 @@ def build_workbook(
     vendors: pd.DataFrame,
     as_of_date: dt.date,
     refresh_ts: Optional[dt.datetime] = None,
+    variance: Optional[pd.DataFrame] = None,
     horizon_weeks: int = FORECAST_HORIZON_WEEKS,
 ) -> Workbook:
-    """Build the four-sheet forecast workbook from the bucketed inputs.
+    """Build the five-sheet forecast workbook from the bucketed inputs.
 
-    The detail sheets are built first so the forecast sheet can size its
-    cross-sheet SUM ranges to the actual entity row counts.
+    Sheet order: 13-Week Forecast, Variance, AR by Customer, AP by Vendor,
+    Assumptions & Notes. The detail sheets are populated first so the forecast
+    sheet can size its cross-sheet SUM ranges to the actual entity row counts.
     """
     wb = Workbook()
-    ws1 = wb.active
-    ws1.title = SHEET_FORECAST
-    ws2 = wb.create_sheet(SHEET_AR)
-    ws3 = wb.create_sheet(SHEET_AP)
-    ws4 = wb.create_sheet(SHEET_NOTES)
+    ws_fc = wb.active
+    ws_fc.title = SHEET_FORECAST
+    ws_var = wb.create_sheet(SHEET_VARIANCE)   # second sheet, by the headline
+    ws_ar = wb.create_sheet(SHEET_AR)
+    ws_ap = wb.create_sheet(SHEET_AP)
+    ws_notes = wb.create_sheet(SHEET_NOTES)
 
     n_cust = _build_entity_sheet(
-        ws2, receipts, customers, "customerNumber", "receipts",
+        ws_ar, receipts, customers, "customerNumber", "receipts",
         "Customer Number", "Customer Name", horizon_weeks,
     )
     n_vend = _build_entity_sheet(
-        ws3, disbursements, vendors, "vendorNumber", "disbursements",
+        ws_ap, disbursements, vendors, "vendorNumber", "disbursements",
         "Vendor Number", "Vendor Name", horizon_weeks,
     )
-    _build_forecast_sheet(ws1, as_of_date, horizon_weeks, n_cust, n_vend)
-    _build_assumptions_sheet(ws4, as_of_date, refresh_ts)
+    _build_forecast_sheet(ws_fc, as_of_date, horizon_weeks, n_cust, n_vend)
+    _build_variance_sheet(ws_var, variance, horizon_weeks)
+    _build_assumptions_sheet(ws_notes, as_of_date, refresh_ts)
 
     return wb
 
@@ -464,7 +584,7 @@ def run(
     wb = build_workbook(
         data["receipts"], data["disbursements"],
         data["customers"], data["vendors"],
-        as_of_date, refresh_ts,
+        as_of_date, refresh_ts, variance=data["variance"],
     )
     saved = write_workbook(wb, output_path)
     logger.info("Wrote workbook to %s", saved)

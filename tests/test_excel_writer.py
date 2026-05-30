@@ -20,11 +20,14 @@ from openpyxl import load_workbook
 
 from src.output.excel_writer import (
     CURRENCY_FMT,
+    DELTA_FMT,
     OUTPUT_FILENAME,
     SHEET_AP,
     SHEET_AR,
     SHEET_FORECAST,
     SHEET_NOTES,
+    SHEET_VARIANCE,
+    VARIANCE_PLACEHOLDER,
     build_workbook,
     latest_refresh_timestamp,
     run,
@@ -123,9 +126,11 @@ def test_run_writes_to_default_data_dir_filename(tmp_path):
     assert saved.name == OUTPUT_FILENAME
 
 
-def test_all_four_sheets_exist_with_expected_names(tmp_path):
+def test_all_sheets_exist_in_expected_order(tmp_path):
     wb = _build(tmp_path)
-    assert wb.sheetnames == [SHEET_FORECAST, SHEET_AR, SHEET_AP, SHEET_NOTES]
+    assert wb.sheetnames == [
+        SHEET_FORECAST, SHEET_VARIANCE, SHEET_AR, SHEET_AP, SHEET_NOTES,
+    ]
 
 
 def test_forecast_sheet_has_header_13_weeks_and_totals_row(tmp_path):
@@ -357,6 +362,109 @@ def test_notes_sheet_mentions_methodology_and_caveats(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Variance sheet
+# ---------------------------------------------------------------------------
+
+
+def _variance():
+    """forecast_variance shape: 2 weeks of today-vs-prior deltas."""
+    return pd.DataFrame({
+        "snapshot_date": ["2026-05-30", "2026-05-30"],
+        "prior_snapshot_date": ["2026-05-29", "2026-05-29"],
+        "forecast_week": [1, 2],
+        "week_start_date": ["2026-05-25", "2026-06-01"],
+        "ar_receipts_today": [1200.0, 800.0],
+        "ar_receipts_prior": [1000.0, 900.0],
+        "ar_receipts_delta": [200.0, -100.0],
+        "ap_disbursements_today": [350.0, 200.0],
+        "ap_disbursements_prior": [300.0, 200.0],
+        "ap_disbursements_delta": [50.0, 0.0],
+        "net_today": [850.0, 600.0],
+        "net_prior": [700.0, 700.0],
+        "net_delta": [150.0, -100.0],
+    })
+
+
+def _build_with_variance(tmp_path, var):
+    wb = build_workbook(
+        _receipts(), _disbursements(), _customers(), _vendors(),
+        AS_OF, refresh_ts=None, variance=var,
+    )
+    path = tmp_path / "var.xlsx"
+    write_workbook(wb, path)
+    return load_workbook(path)
+
+
+def test_variance_sheet_is_second(tmp_path):
+    wb = _build(tmp_path)
+    assert wb.sheetnames[1] == SHEET_VARIANCE
+
+
+def test_variance_first_run_shows_placeholder(tmp_path):
+    """No prior snapshot (variance None) -> placeholder message in A1, no grid."""
+    wb = _build(tmp_path)   # _build passes no variance -> None
+    ws = wb[SHEET_VARIANCE]
+
+    assert ws.cell(row=1, column=1).value == VARIANCE_PLACEHOLDER
+    assert ws.cell(row=2, column=1).value is None  # no data grid
+
+
+def test_variance_empty_dataframe_also_shows_placeholder(tmp_path):
+    empty = pd.DataFrame()
+    wb = _build_with_variance(tmp_path, empty)
+    ws = wb[SHEET_VARIANCE]
+    assert ws.cell(row=1, column=1).value == VARIANCE_PLACEHOLDER
+
+
+def test_variance_populated_has_13_rows_plus_header_and_totals(tmp_path):
+    wb = _build_with_variance(tmp_path, _variance())
+    ws = wb[SHEET_VARIANCE]
+
+    assert ws.max_row == 15  # header + 13 weeks + totals
+    assert ws.cell(row=1, column=1).value == "Forecast Week"
+    assert ws.cell(row=15, column=1).value == "TOTAL"
+    assert [ws.cell(row=r, column=1).value for r in range(2, 15)] == list(range(1, 14))
+
+
+def test_variance_delta_columns_are_formulas_with_delta_format(tmp_path):
+    wb = _build_with_variance(tmp_path, _variance())
+    ws = wb[SHEET_VARIANCE]
+
+    # AR Δ (E), AP Δ (H), Net Δ (K) are formulas with the green/red delta format.
+    assert ws.cell(row=2, column=5).value == "=C2-D2"
+    assert ws.cell(row=2, column=8).value == "=F2-G2"
+    assert ws.cell(row=2, column=11).value == "=I2-J2"
+    assert ws.cell(row=2, column=5).number_format == DELTA_FMT
+    assert ws.cell(row=2, column=11).number_format == DELTA_FMT
+    # Net today/prior are also formulas.
+    assert ws.cell(row=2, column=9).value == "=C2-F2"
+    assert ws.cell(row=2, column=10).value == "=D2-G2"
+
+
+def test_variance_today_prior_source_values(tmp_path):
+    wb = _build_with_variance(tmp_path, _variance())
+    ws = wb[SHEET_VARIANCE]
+
+    # Week 1: AR today/prior and AP today/prior come straight from the table.
+    assert ws.cell(row=2, column=3).value == pytest.approx(1200.0)
+    assert ws.cell(row=2, column=4).value == pytest.approx(1000.0)
+    assert ws.cell(row=2, column=6).value == pytest.approx(350.0)
+    assert ws.cell(row=2, column=7).value == pytest.approx(300.0)
+    # Totals row sums via formula.
+    assert ws.cell(row=15, column=3).value == "=SUM(C2:C14)"
+
+
+def test_variance_missing_weeks_filled_with_zero(tmp_path):
+    """Variance with only week 1 still renders 13 rows; week 2 source cells = 0."""
+    one_week = _variance().iloc[[0]].copy()
+    wb = _build_with_variance(tmp_path, one_week)
+    ws = wb[SHEET_VARIANCE]
+
+    assert ws.max_row == 15
+    assert ws.cell(row=3, column=3).value == pytest.approx(0.0)  # week 2 AR today
+
+
+# ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------
 
@@ -371,7 +479,9 @@ def test_empty_inputs_still_produce_four_sheets(tmp_path):
     write_workbook(wb, path)
     loaded = load_workbook(path)
 
-    assert loaded.sheetnames == [SHEET_FORECAST, SHEET_AR, SHEET_AP, SHEET_NOTES]
+    assert loaded.sheetnames == [
+        SHEET_FORECAST, SHEET_VARIANCE, SHEET_AR, SHEET_AP, SHEET_NOTES,
+    ]
     ws = loaded[SHEET_FORECAST]
     assert ws.max_row == 15  # header + 13 + totals
     # Totals are still formulas; detail SUM ranges collapse to an empty row-2 cell.
