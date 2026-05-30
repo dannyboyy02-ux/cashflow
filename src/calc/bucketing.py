@@ -262,7 +262,12 @@ def run(
 if __name__ == "__main__":
     run()
     # Pipeline wiring: after bucketing writes the week tables, capture a dated
-    # snapshot of them for day-over-day variance. Done here in __main__ (not
-    # inside run()) so programmatic callers of run() stay side-effect-free.
-    from src.calc import snapshot
+    # snapshot of them, then compute today-vs-prior variance from the snapshot
+    # history. Done here in __main__ (not inside run()) so programmatic callers
+    # of run() stay side-effect-free. A full daily refresh
+    # (python -m src.calc.bucketing) thus produces: weekly tables -> dated
+    # snapshots -> variance. variance.run() no-ops cleanly on the first run when
+    # only one snapshot date exists.
+    from src.calc import snapshot, variance
     snapshot.run()
+    variance.run()
