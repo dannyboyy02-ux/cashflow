@@ -5,9 +5,13 @@ import pandas as pd
 import pytest
 
 from src.calc.bucketing import (
+    SOURCE_AR,
+    SOURCE_SO,
     aggregate_disbursements_by_week,
     aggregate_receipts_by_week,
     assign_forecast_week,
+    bucket_so_receipts,
+    build_combined_receipts,
     monday_of_week,
 )
 
@@ -291,3 +295,83 @@ def test_ap_aggregate_with_empty_input_returns_empty():
     agg = aggregate_disbursements_by_week(stamped_w, horizon_weeks=13)
 
     assert len(agg) == 0
+
+# ---- open-SO receipts bucketing + combined view (Task 4) ----------------------
+
+
+def _so_stamped(*rows):
+    """Build a stamped SO frame from (customer, collection_date, outstandingAmount)."""
+    return pd.DataFrame({
+        "customerNumber": [r[0] for r in rows],
+        "expected_collection_date": [r[1] for r in rows],
+        "outstandingAmount": [r[2] for r in rows],
+        "source_stream": ["open_so"] * len(rows),
+    })
+
+
+def test_so_receipts_bucket_into_correct_forecast_week():
+    """SO lines bucket by expected_collection_date, summing outstandingAmount."""
+    so = _so_stamped(
+        ("CUST-A", dt.date(2026, 5, 29), 1000.0),  # week 1
+        ("CUST-A", dt.date(2026, 6, 1),  2000.0),  # week 2
+        ("CUST-B", dt.date(2026, 6, 1),  500.0),   # week 2
+    )
+
+    agg = bucket_so_receipts(so, AS_OF_FRIDAY, horizon_weeks=13)
+
+    # value column is named "receipts" to match the AR side
+    assert "receipts" in agg.columns
+    a_w1 = agg[(agg["customerNumber"] == "CUST-A") & (agg["forecast_week"] == 1)]
+    a_w2 = agg[(agg["customerNumber"] == "CUST-A") & (agg["forecast_week"] == 2)]
+    assert a_w1.iloc[0]["receipts"] == pytest.approx(1000.0)
+    assert a_w2.iloc[0]["receipts"] == pytest.approx(2000.0)
+
+
+def _ar_by_week(*rows):
+    return pd.DataFrame({
+        "customerNumber": [r[0] for r in rows],
+        "forecast_week": [r[1] for r in rows],
+        "week_start_date": [r[2] for r in rows],
+        "receipts": [r[3] for r in rows],
+    })
+
+
+def test_combined_view_row_count_is_ar_plus_so():
+    ar = _ar_by_week(("CUST-A", 1, dt.date(2026, 5, 25), 100.0),
+                     ("CUST-B", 2, dt.date(2026, 6, 1), 200.0))
+    so = _ar_by_week(("CUST-A", 3, dt.date(2026, 6, 8), 300.0))
+
+    combined = build_combined_receipts(ar, so)
+
+    assert len(combined) == len(ar) + len(so)  # 3
+
+
+def test_combined_view_preserves_source_discriminator():
+    ar = _ar_by_week(("CUST-A", 1, dt.date(2026, 5, 25), 100.0))
+    so = _ar_by_week(("CUST-A", 1, dt.date(2026, 5, 25), 300.0))
+
+    combined = build_combined_receipts(ar, so)
+
+    assert set(combined["source"]) == {SOURCE_AR, SOURCE_SO}
+
+
+def test_customer_in_both_streams_has_two_rows_not_summed():
+    """Same customer+week in both streams stays as two rows (one per source)."""
+    ar = _ar_by_week(("CUST-A", 1, dt.date(2026, 5, 25), 100.0))
+    so = _ar_by_week(("CUST-A", 1, dt.date(2026, 5, 25), 300.0))
+
+    combined = build_combined_receipts(ar, so)
+
+    cust_a = combined[combined["customerNumber"] == "CUST-A"]
+    assert len(cust_a) == 2
+    assert sorted(cust_a["receipts"].tolist()) == [100.0, 300.0]  # not a single 400.0
+
+
+def test_combined_view_empty_so_is_just_ar():
+    ar = _ar_by_week(("CUST-A", 1, dt.date(2026, 5, 25), 100.0))
+    empty_so = pd.DataFrame(columns=["customerNumber", "forecast_week", "week_start_date", "receipts"])
+
+    combined = build_combined_receipts(ar, empty_so)
+
+    assert len(combined) == 1
+    assert combined.iloc[0]["source"] == SOURCE_AR

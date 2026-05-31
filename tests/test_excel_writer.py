@@ -524,3 +524,88 @@ def test_latest_refresh_timestamp_picks_newest_csv(tmp_path):
     ts = latest_refresh_timestamp(tmp_path)
     assert ts is not None
     assert isinstance(ts, dt.datetime)
+
+
+# ---------------------------------------------------------------------------
+# Open-SO integration (Task 5): combined AR+SO on the AR-by-Customer sheet
+# ---------------------------------------------------------------------------
+
+
+def _combined():
+    """combined_receipts_by_week shape: CUST-A in BOTH sources, CUST-B SO-only."""
+    return pd.DataFrame({
+        "customerNumber": ["CUST-A", "CUST-A", "CUST-B", "CUST-D"],
+        "forecast_week":  [1, 8, 9, 10],
+        "week_start_date": ["2026-05-25", "2026-07-13", "2026-07-20", "2026-07-27"],
+        "receipts": [10_000.0, 4_000.0, 2_000.0, 1_500.0],
+        "source": ["open_ar", "open_so", "open_so", "open_so"],
+    })
+
+
+def _build_with_combined(tmp_path, combined):
+    wb = build_workbook(
+        _receipts(), _disbursements(), _customers(), _vendors(),
+        AS_OF, refresh_ts=None, combined=combined,
+    )
+    path = tmp_path / "combined.xlsx"
+    write_workbook(wb, path)
+    return load_workbook(path)
+
+
+def test_ar_sheet_has_source_column(tmp_path):
+    wb = _build(tmp_path)  # AR-only fallback
+    ws = wb[SHEET_AR]
+    # Header: Customer Number, Customer Name, Week 1..13, Total, Source = 17 cols
+    assert ws.cell(row=1, column=17).value == "Source"
+    assert ws.cell(row=1, column=16).value == "Total"
+    # AR-only fallback tags every row open_ar.
+    assert ws.cell(row=2, column=17).value == "open_ar"
+
+
+def test_ar_sheet_combined_customer_in_both_sources_has_two_rows(tmp_path):
+    wb = _build_with_combined(tmp_path, _combined())
+    ws = wb[SHEET_AR]
+
+    rows = [(ws.cell(r, 1).value, ws.cell(r, 17).value) for r in range(2, ws.max_row + 1)]
+    cust_a_rows = [r for r in rows if r[0] == "CUST-A"]
+    assert len(cust_a_rows) == 2
+    assert {src for _, src in cust_a_rows} == {"open_ar", "open_so"}
+
+
+def test_forecast_ar_total_reflects_combined_sources(tmp_path):
+    """Forecast AR receipts SUM over the AR sheet now includes SO past week 6."""
+    wb = _build_with_combined(tmp_path, _combined())
+    ar = wb[SHEET_AR]
+
+    # Week 8 (column J = 3+7) total across all AR rows = the open_so 4,000.
+    wk8_total = sum(ar.cell(r, 10).value or 0.0 for r in range(2, ar.max_row + 1))
+    assert wk8_total == pytest.approx(4_000.0)
+    # Grand total across the sheet = sum of all combined receipts.
+    grand = sum(_row_week_value_sum(ar, r) for r in range(2, ar.max_row + 1))
+    assert grand == pytest.approx(_combined()["receipts"].sum())  # 17,500
+
+
+def test_workbook_renders_ar_only_when_combined_empty(tmp_path):
+    """Graceful degradation: empty combined -> AR-only sheet, no error."""
+    empty_combined = pd.DataFrame(
+        columns=["customerNumber", "forecast_week", "week_start_date", "receipts", "source"]
+    )
+    wb = _build_with_combined(tmp_path, empty_combined)
+    ws = wb[SHEET_AR]
+
+    # Falls back to the _receipts() fixture: 3 customers, all open_ar.
+    assert ws.max_row == _receipts()["customerNumber"].nunique() + 1
+    sources = {ws.cell(r, 17).value for r in range(2, ws.max_row + 1)}
+    assert sources == {"open_ar"}
+
+
+def test_workbook_renders_ar_only_when_combined_none(tmp_path):
+    """combined=None (table absent) also falls back cleanly to AR-only."""
+    wb = build_workbook(
+        _receipts(), _disbursements(), _customers(), _vendors(),
+        AS_OF, combined=None,
+    )
+    path = tmp_path / "none.xlsx"
+    write_workbook(wb, path)
+    ws = load_workbook(path)[SHEET_AR]
+    assert ws.max_row == _receipts()["customerNumber"].nunique() + 1

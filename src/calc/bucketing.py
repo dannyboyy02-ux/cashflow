@@ -55,6 +55,21 @@ AP_ENTITY_COL = "vendorNumber"
 AP_VALUE_COL = "disbursement_amount"
 AP_AGG_COL = "disbursements"
 
+# Open-SO side: stamped open SO lines with expected_collection_date -> receipts
+# by week. Same long-format schema as the AR side (value column named "receipts")
+# so downstream code treats AR and SO receipts uniformly.
+SO_INPUT_TABLE = "so_open_with_expected_collection"
+SO_OUTPUT_TABLE = "so_receipts_by_week"
+SO_DATE_COL = "expected_collection_date"
+SO_ENTITY_COL = "customerNumber"
+SO_VALUE_COL = "outstandingAmount"
+SO_AGG_COL = "receipts"
+
+# Union of AR + SO weekly receipts with a source discriminator.
+COMBINED_TABLE = "combined_receipts_by_week"
+SOURCE_AR = "open_ar"
+SOURCE_SO = "open_so"
+
 # Backwards-compatible alias: the original single-purpose constant name.
 OUTPUT_TABLE = AR_OUTPUT_TABLE
 
@@ -163,9 +178,74 @@ def aggregate_disbursements_by_week(
     )
 
 
+def aggregate_so_receipts_by_week(
+    stamped_with_weeks: pd.DataFrame,
+    horizon_weeks: int = FORECAST_HORIZON_WEEKS,
+) -> pd.DataFrame:
+    """Open-SO wrapper: receipts per (customer, week) from outstandingAmount.
+
+    Names the value column "receipts" to match ar_receipts_by_week so the two
+    streams share a schema and the combined view / writer treat them uniformly.
+    """
+    return aggregate_by_week(
+        stamped_with_weeks,
+        entity_col=SO_ENTITY_COL,
+        value_col=SO_VALUE_COL,
+        agg_col=SO_AGG_COL,
+        horizon_weeks=horizon_weeks,
+    )
+
+
+def bucket_so_receipts(
+    so_stamped: pd.DataFrame,
+    as_of: dt.date,
+    horizon_weeks: int = FORECAST_HORIZON_WEEKS,
+) -> pd.DataFrame:
+    """Assign forecast weeks by expected_collection_date and aggregate SO receipts.
+
+    Reuses the shared assign_forecast_week + aggregate_by_week core. Returns the
+    long-format (customerNumber, forecast_week, week_start_date, receipts) frame.
+    """
+    stamped_with_weeks = assign_forecast_week(so_stamped, as_of, date_col=SO_DATE_COL)
+    return aggregate_so_receipts_by_week(stamped_with_weeks, horizon_weeks)
+
+
+def build_combined_receipts(
+    ar_by_week: pd.DataFrame,
+    so_by_week: pd.DataFrame,
+) -> pd.DataFrame:
+    """Union AR (source=open_ar) and SO (source=open_so) weekly receipts.
+
+    Does NOT mutate the inputs. A customer appearing in both streams yields two
+    rows (one per source), never a silently summed single row -- the writer and
+    any downstream consumer decide how to combine them.
+    """
+    cols = ["customerNumber", "forecast_week", "week_start_date", "receipts", "source"]
+    parts = []
+    for df, src in ((ar_by_week, SOURCE_AR), (so_by_week, SOURCE_SO)):
+        if df is not None and not df.empty:
+            tagged = df.copy()
+            tagged["source"] = src
+            parts.append(tagged[cols])
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    return pd.concat(parts, ignore_index=True)
+
+
 def load_table(name: str) -> pd.DataFrame:
     """Read an entire SQLite table into a DataFrame."""
     with get_connection() as conn:
+        return pd.read_sql(f"SELECT * FROM {name}", conn)
+
+
+def _load_optional(name: str) -> pd.DataFrame:
+    """Read a table, or return an empty frame if it doesn't exist yet."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        )
+        if cur.fetchone() is None:
+            return pd.DataFrame()
         return pd.read_sql(f"SELECT * FROM {name}", conn)
 
 
@@ -249,6 +329,49 @@ def run_disbursements(
     logger.info("Wrote %d rows to SQLite table %s", n, AP_OUTPUT_TABLE)
 
 
+def run_so_receipts(
+    as_of_date: Optional[dt.date] = None,
+    horizon_weeks: int = FORECAST_HORIZON_WEEKS,
+) -> None:
+    """Bucket open-SO receipts: load stamped SO lines, assign weeks, aggregate, write.
+
+    Tolerant of a missing input table (SO file not refreshed): writes an empty
+    so_receipts_by_week so the combined view and the rest of the pipeline run.
+    """
+    if as_of_date is None:
+        as_of_date = dt.date.today()
+    stamped = _load_optional(SO_INPUT_TABLE)
+    if stamped.empty:
+        logger.warning(
+            "%s is missing/empty; writing empty %s (no open-SO layer this run).",
+            SO_INPUT_TABLE, SO_OUTPUT_TABLE,
+        )
+        empty = pd.DataFrame(columns=[SO_ENTITY_COL, "forecast_week", "week_start_date", SO_AGG_COL])
+        write_to_sqlite(empty, SO_OUTPUT_TABLE)
+        return
+
+    agg = bucket_so_receipts(stamped, as_of_date, horizon_weeks)
+    stamped_with_weeks = assign_forecast_week(stamped, as_of_date, date_col=SO_DATE_COL)
+    logger.info(
+        "SO receipts bucketing summary: %s",
+        _summary(agg, stamped_with_weeks, horizon_weeks, as_of_date, SO_VALUE_COL),
+    )
+    n = write_to_sqlite(agg, SO_OUTPUT_TABLE)
+    logger.info("Wrote %d rows to SQLite table %s", n, SO_OUTPUT_TABLE)
+
+
+def run_combined_view() -> None:
+    """Union AR + SO weekly receipts into combined_receipts_by_week (with source)."""
+    ar = _load_optional(AR_OUTPUT_TABLE)
+    so = _load_optional(SO_OUTPUT_TABLE)
+    combined = build_combined_receipts(ar, so)
+    n = write_to_sqlite(combined, COMBINED_TABLE)
+    logger.info(
+        "Wrote %d rows to SQLite table %s (AR=%d, SO=%d)",
+        n, COMBINED_TABLE, len(ar), len(so),
+    )
+
+
 def run(
     as_of_date: Optional[dt.date] = None,
     horizon_weeks: int = FORECAST_HORIZON_WEEKS,
@@ -261,13 +384,14 @@ def run(
 
 if __name__ == "__main__":
     run()
-    # Pipeline wiring: after bucketing writes the week tables, capture a dated
-    # snapshot of them, then compute today-vs-prior variance from the snapshot
-    # history. Done here in __main__ (not inside run()) so programmatic callers
-    # of run() stay side-effect-free. A full daily refresh
-    # (python -m src.calc.bucketing) thus produces: weekly tables -> dated
-    # snapshots -> variance. variance.run() no-ops cleanly on the first run when
-    # only one snapshot date exists.
+    # Pipeline wiring (side effects live in __main__ so run() stays pure):
+    # AR bucketing -> SO bucketing -> combined view -> snapshot -> variance.
+    # A full daily refresh (python -m src.calc.bucketing) thus produces the
+    # weekly AR/AP/SO tables, the combined AR+SO receipts view, a dated snapshot,
+    # and today-vs-prior variance. run_so_receipts no-ops cleanly when the SO
+    # input is missing; variance no-ops on the first run (one snapshot date).
     from src.calc import snapshot, variance
+    run_so_receipts()
+    run_combined_view()
     snapshot.run()
     variance.run()

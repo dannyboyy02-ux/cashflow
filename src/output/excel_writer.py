@@ -56,6 +56,8 @@ from src.db import get_connection
 from src.calc.bucketing import (
     AR_OUTPUT_TABLE,
     AP_OUTPUT_TABLE,
+    COMBINED_TABLE,
+    SOURCE_AR,
     monday_of_week,
 )
 
@@ -130,6 +132,7 @@ def load_inputs() -> dict[str, pd.DataFrame]:
         "customers": load_table("bc_customers"),
         "vendors": load_table("bc_vendors"),
         "variance": _load_optional("forecast_variance"),
+        "combined": _load_optional(COMBINED_TABLE),
     }
 
 
@@ -358,6 +361,78 @@ def _build_entity_sheet(
 
 
 # ---------------------------------------------------------------------------
+# AR by Customer -- open-AR + open-SO contributions, one row per (customer, source)
+# ---------------------------------------------------------------------------
+
+
+def _build_ar_by_customer_sheet(
+    ws: Worksheet,
+    ar_long: pd.DataFrame,
+    master: pd.DataFrame,
+    horizon_weeks: int,
+) -> int:
+    """AR-by-customer detail with a Source column distinguishing open-AR vs open-SO.
+
+    Accepts either combined_receipts_by_week (has a "source" column) or
+    ar_receipts_by_week (no source -> treated as all open_ar). One row per
+    (customer, source), sorted by row total descending. The week columns stay at
+    C..O and Total at P -- identical to the AP sheet -- so the forecast sheet's
+    cross-sheet SUM over column C..O captures BOTH sources automatically; Source
+    is an extra trailing column (Q). Returns the number of data rows written.
+    """
+    headers = (
+        ["Customer Number", "Customer Name"]
+        + [f"Week {w}" for w in range(1, horizon_weeks + 1)]
+        + ["Total", "Source"]
+    )
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+
+    name_map: dict = {}
+    if not master.empty and "number" in master.columns and "displayName" in master.columns:
+        name_map = dict(zip(master["number"], master["displayName"]))
+
+    first_week_col = 3
+    last_week_col = 2 + horizon_weeks         # O for 13 weeks
+    total_col = last_week_col + 1             # P
+    source_col = total_col + 1                # Q
+    first_letter = get_column_letter(first_week_col)
+    last_letter = get_column_letter(last_week_col)
+
+    n_rows = 0
+    if ar_long is not None and not ar_long.empty and "forecast_week" in ar_long.columns:
+        df = ar_long.copy()
+        if "source" not in df.columns:
+            df["source"] = SOURCE_AR
+        built = []
+        for (cust, source), g in df.groupby(["customerNumber", "source"]):
+            wk_sum = g.groupby("forecast_week")["receipts"].sum()
+            week_vals = [float(wk_sum.get(w, 0.0)) for w in range(1, horizon_weeks + 1)]
+            built.append((cust, name_map.get(cust, ""), source, week_vals, sum(week_vals)))
+        built.sort(key=lambda x: x[4], reverse=True)
+
+        for cust, name, source, week_vals, _total in built:
+            r = ws.max_row + 1
+            ws.cell(row=r, column=1, value=cust).font = F_BASE
+            ws.cell(row=r, column=2, value=name).font = F_BASE
+            for j, v in enumerate(week_vals):
+                _money(ws.cell(row=r, column=first_week_col + j, value=v))
+            _money(ws.cell(row=r, column=total_col,
+                           value=f"=SUM({first_letter}{r}:{last_letter}{r})"))
+            ws.cell(row=r, column=source_col, value=source).font = F_BASE
+            n_rows += 1
+
+    ws.freeze_panes = "C2"
+    widths = {"A": 16, "B": 32}
+    for w in range(1, horizon_weeks + 1):
+        widths[get_column_letter(2 + w)] = 12
+    widths[get_column_letter(total_col)] = 16
+    widths[get_column_letter(source_col)] = 10
+    _set_widths(ws, widths)
+    return n_rows
+
+
+# ---------------------------------------------------------------------------
 # Variance sheet -- today vs prior snapshot (week level)
 # ---------------------------------------------------------------------------
 
@@ -529,6 +604,7 @@ def build_workbook(
     as_of_date: dt.date,
     refresh_ts: Optional[dt.datetime] = None,
     variance: Optional[pd.DataFrame] = None,
+    combined: Optional[pd.DataFrame] = None,
     horizon_weeks: int = FORECAST_HORIZON_WEEKS,
 ) -> Workbook:
     """Build the five-sheet forecast workbook from the bucketed inputs.
@@ -536,6 +612,11 @@ def build_workbook(
     Sheet order: 13-Week Forecast, Variance, AR by Customer, AP by Vendor,
     Assumptions & Notes. The detail sheets are populated first so the forecast
     sheet can size its cross-sheet SUM ranges to the actual entity row counts.
+
+    The AR-by-Customer sheet uses combined_receipts_by_week (open-AR + open-SO)
+    when available, so the headline forecast's AR receipts fill past the wk-6
+    cliff; if combined is missing/empty it falls back to AR-only (receipts),
+    rendering the old cliff with no error.
     """
     wb = Workbook()
     ws_fc = wb.active
@@ -545,10 +626,8 @@ def build_workbook(
     ws_ap = wb.create_sheet(SHEET_AP)
     ws_notes = wb.create_sheet(SHEET_NOTES)
 
-    n_cust = _build_entity_sheet(
-        ws_ar, receipts, customers, "customerNumber", "receipts",
-        "Customer Number", "Customer Name", horizon_weeks,
-    )
+    ar_long = combined if (combined is not None and not combined.empty) else receipts
+    n_cust = _build_ar_by_customer_sheet(ws_ar, ar_long, customers, horizon_weeks)
     n_vend = _build_entity_sheet(
         ws_ap, disbursements, vendors, "vendorNumber", "disbursements",
         "Vendor Number", "Vendor Name", horizon_weeks,
@@ -591,7 +670,8 @@ def run(
     wb = build_workbook(
         data["receipts"], data["disbursements"],
         data["customers"], data["vendors"],
-        as_of_date, refresh_ts, variance=data["variance"],
+        as_of_date, refresh_ts,
+        variance=data["variance"], combined=data["combined"],
     )
     saved = write_workbook(wb, output_path)
     logger.info("Wrote workbook to %s", saved)

@@ -109,6 +109,34 @@ def append_snapshot(
     return len(df)
 
 
+# When present, the combined AR+SO receipts view is preferred as the AR-side
+# snapshot source, so the snapshot history (and the variance built from it)
+# captures open-SO movement, not just open-AR. Falls back to AR-only.
+COMBINED_SOURCE_TABLE = "combined_receipts_by_week"
+
+
+def _ar_receipts_source() -> pd.DataFrame:
+    """AR-side snapshot source: combined AR+SO receipts if available, else AR-only.
+
+    The combined view carries a per-source row split; it is summed back to one
+    row per (customerNumber, forecast_week, week_start_date) so the snapshot
+    schema is identical whether or not the open-SO layer is present.
+    """
+    conn = get_connection()
+    try:
+        combined = (
+            pd.read_sql(f"SELECT * FROM {COMBINED_SOURCE_TABLE}", conn)
+            if _table_exists(conn, COMBINED_SOURCE_TABLE) else pd.DataFrame()
+        )
+    finally:
+        conn.close()
+    if not combined.empty:
+        return combined.groupby(
+            ["customerNumber", "forecast_week", "week_start_date"], as_index=False
+        )["receipts"].sum()
+    return load_table(AR_SOURCE_TABLE)
+
+
 def run(
     snapshot_date: Optional[dt.date] = None,
     as_of_date: Optional[dt.date] = None,
@@ -120,7 +148,7 @@ def run(
     if as_of_date is None:
         as_of_date = dt.date.today()
 
-    ar = load_table(AR_SOURCE_TABLE)
+    ar = _ar_receipts_source()
     ap = load_table(AP_SOURCE_TABLE)
     logger.info(
         "Loaded %d AR receipt rows, %d AP disbursement rows to snapshot",
