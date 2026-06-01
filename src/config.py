@@ -24,6 +24,9 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 FORECAST_HORIZON_WEEKS: int = _yaml_config["forecast"]["horizon_weeks"]
 DATA_DIR: Path = PROJECT_ROOT / _yaml_config["paths"]["data_dir"]
+# Manually-maintained model inputs (e.g. payroll). Gitignored -- holds real
+# figures and the repo is public.
+INPUTS_DIR: Path = PROJECT_ROOT / "inputs"
 WORKBOOK_TEMPLATE: Path = PROJECT_ROOT / _yaml_config["paths"]["workbook_template"]
 WORKBOOK_OUTPUT: Path = PROJECT_ROOT / _yaml_config["paths"]["workbook_output"]
 LOG_FORMAT: str = _yaml_config["logging"]["format"]

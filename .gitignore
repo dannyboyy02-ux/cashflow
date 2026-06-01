@@ -12,6 +12,7 @@ __pycache__/
 
 # Data — never commit
 data/
+inputs/
 *.sqlite
 *.sqlite3
 *.db

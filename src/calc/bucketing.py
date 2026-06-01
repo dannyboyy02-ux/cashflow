@@ -502,12 +502,16 @@ if __name__ == "__main__":
     # combined_receipts needs AR+SO; combined_disbursements needs AP+PO; snapshot
     # needs both combined views. The SO/PO steps no-op cleanly when their inputs
     # are missing; variance no-ops on the first run (one snapshot date).
-    from src.calc import snapshot, variance
+    from src.calc import snapshot, variance, payroll
     run_receipts()
     run_so_receipts()
     run_combined_view()
     run_disbursements()
     run_po_payments()
     run_combined_disbursements()
+    # Payroll is a separate disbursement line (NOT folded into
+    # combined_disbursements_by_week); produced each run alongside the AP/PO
+    # disbursement steps. Rendering + variance integration come in a later phase.
+    payroll.run()
     snapshot.run()
     variance.run()
