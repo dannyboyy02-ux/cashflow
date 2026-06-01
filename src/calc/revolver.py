@@ -105,9 +105,14 @@ def compute_revolver(
     """Run the sequential revolver plug. Returns (activity, interest, cash_position).
 
     inflows / base_outflows are {forecast_week -> amount} (base_outflows excludes
-    revolver interest, which is computed here on the opening balance). State is
-    carried forward week to week; money columns are rounded to cents so the
-    chain (wk N begin == wk N-1 ending) holds exactly.
+    revolver interest, which is computed here on the opening balance).
+
+    To MIRROR the visible Excel math on the Revolver tab to the penny, only the
+    interest is rounded mid-stream (Excel ROUND()s interest too); every other
+    intermediate carries full precision exactly as the Excel formulas do. Stored
+    table values are rounded to cents for display, but the week-to-week carry
+    (begin = prior ending) uses the unrounded values so no rounding drift
+    accumulates relative to Excel.
     """
     facility_total = float(config.get("facility_total", 0.0))
     lc_carve_out = float(config.get("lc_carve_out", 0.0))
@@ -127,9 +132,11 @@ def compute_revolver(
         inflow = float(inflows.get(wk, 0.0))
         base_out = float(base_outflows.get(wk, 0.0))
 
+        # Only interest is rounded mid-stream (Excel ROUND()s it); the rest
+        # carries full precision exactly like the Excel formulas.
         revolver_interest = round(begin_revolver * weekly_rate, 2)
-        total_outflows = round(base_out + revolver_interest, 2)
-        pre_revolver_ending = round(begin_cash + inflow - total_outflows, 2)
+        total_outflows = base_out + revolver_interest
+        pre_revolver_ending = begin_cash + inflow - total_outflows
 
         available_to_draw = max(0.0, max_capacity - begin_revolver)
         draw = repay = 0.0
@@ -147,19 +154,17 @@ def compute_revolver(
         else:
             revolver_change = 0.0
 
-        ending_revolver = round(begin_revolver + revolver_change, 2)
-        ending_cash = round(pre_revolver_ending + revolver_change, 2)
-        available_capacity = round(max_capacity - ending_revolver, 2)
-        draw = round(draw, 2)
-        repay = round(repay, 2)
+        ending_revolver = begin_revolver + revolver_change
+        ending_cash = pre_revolver_ending + revolver_change
+        available_capacity = max_capacity - ending_revolver
 
         activity_rows.append({
             "forecast_week": wk, "week_start_date": monday,
             "begin_revolver_balance": round(begin_revolver, 2),
-            "revolver_draw": draw, "revolver_repay": repay,
-            "ending_revolver_balance": ending_revolver,
+            "revolver_draw": round(draw, 2), "revolver_repay": round(repay, 2),
+            "ending_revolver_balance": round(ending_revolver, 2),
             "revolver_interest_accrued": revolver_interest,
-            "available_capacity": available_capacity,
+            "available_capacity": round(available_capacity, 2),
             "capacity_breached": bool(capacity_breached),
         })
         interest_rows.append({
@@ -169,11 +174,14 @@ def compute_revolver(
         cash_rows.append({
             "forecast_week": wk, "week_start_date": monday,
             "beginning_cash": round(begin_cash, 2), "total_inflows": round(inflow, 2),
-            "total_outflows": total_outflows, "pre_revolver_ending_cash": pre_revolver_ending,
-            "revolver_draw": draw, "revolver_repay": repay,
-            "ending_cash": ending_cash, "ending_revolver_balance": ending_revolver,
+            "total_outflows": round(total_outflows, 2),
+            "pre_revolver_ending_cash": round(pre_revolver_ending, 2),
+            "revolver_draw": round(draw, 2), "revolver_repay": round(repay, 2),
+            "ending_cash": round(ending_cash, 2),
+            "ending_revolver_balance": round(ending_revolver, 2),
         })
 
+        # Carry FULL precision forward (matches Excel; no rounding drift).
         begin_cash = ending_cash
         begin_revolver = ending_revolver
 

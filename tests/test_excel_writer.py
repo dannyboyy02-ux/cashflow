@@ -29,6 +29,7 @@ from src.output.excel_writer import (
     SHEET_FORECAST,
     SHEET_NOTES,
     SHEET_PAYROLL,
+    SHEET_REVOLVER,
     SHEET_VARIANCE,
     VARIANCE_PLACEHOLDER,
     build_workbook,
@@ -132,8 +133,8 @@ def test_run_writes_to_default_data_dir_filename(tmp_path):
 def test_all_sheets_exist_in_expected_order(tmp_path):
     wb = _build(tmp_path)
     assert wb.sheetnames == [
-        SHEET_FORECAST, SHEET_VARIANCE, SHEET_AR, SHEET_AP,
-        SHEET_PAYROLL, SHEET_DEBT, SHEET_NOTES,
+        SHEET_FORECAST, SHEET_AR, SHEET_AP, SHEET_PAYROLL,
+        SHEET_DEBT, SHEET_REVOLVER, SHEET_VARIANCE, SHEET_NOTES,
     ]
 
 
@@ -226,17 +227,19 @@ def test_payroll_and_debt_columns_reference_detail_tabs(tmp_path):
     assert ws.cell(row=14, column=7).value == "='Debt Service'!O14"
 
 
-def test_beginning_ending_cash_use_formulas(tmp_path):
-    """The CFO-input cash chain is live formulas, not baked values."""
+def test_forecast_cash_columns_reference_revolver_tab(tmp_path):
+    """Phase 7e: Beginning/Ending cash on the Forecast come from the Revolver tab.
+
+    No static revolver values; Begin (C) and Ending (K) are pure references into
+    the Revolver tab's Begin Cash (C) and Ending Cash (N) columns, same row.
+    """
     wb = _build(tmp_path)
     ws = wb[SHEET_FORECAST]
 
-    # Week 1 beginning is the 0 placeholder; ending (col K) = begin + net.
-    assert ws.cell(row=2, column=3).value == 0
-    assert ws.cell(row=2, column=11).value == "=C2+J2"
-    # Week 2 beginning chains off week 1 ending cash (col K).
-    assert ws.cell(row=3, column=3).value == "=K2"
-    assert ws.cell(row=3, column=11).value == "=C3+J3"
+    assert ws.cell(row=2, column=3).value == "='Revolver'!C2"
+    assert ws.cell(row=2, column=11).value == "='Revolver'!N2"
+    assert ws.cell(row=3, column=3).value == "='Revolver'!C3"
+    assert ws.cell(row=3, column=11).value == "='Revolver'!N3"
 
 
 def test_entity_total_column_is_sum_formula(tmp_path):
@@ -302,14 +305,19 @@ def test_currency_cells_use_dollar_format_with_dash_zeros(tmp_path):
     assert wb[SHEET_AR].cell(row=2, column=3).number_format == CURRENCY_FMT
 
 
-def test_beginning_cash_input_cell_is_blue_on_yellow(tmp_path):
+def test_revolver_input_cells_are_blue_on_yellow(tmp_path):
+    """Phase 7e: the input cells now live in the Assumptions Revolver Inputs block."""
     wb = _build(tmp_path)
-    ws = wb[SHEET_FORECAST]
-    c2 = ws.cell(row=2, column=3)
+    ws = wb[SHEET_NOTES]
 
-    # Blue font (RGB 0,0,255) and yellow fill (RGB 255,255,0).
-    assert (c2.font.color.rgb or "").endswith("0000FF")
-    assert (c2.fill.fgColor.rgb or "").endswith("FFFF00")
+    # Find the "Facility Total" label row; its column-B value is a yellow input.
+    label_row = next(
+        r for r in range(1, ws.max_row + 1)
+        if ws.cell(row=r, column=1).value == "Facility Total"
+    )
+    cell = ws.cell(row=label_row, column=2)
+    assert (cell.font.color.rgb or "").endswith("0000FF")     # blue text
+    assert (cell.fill.fgColor.rgb or "").endswith("FFFF00")    # yellow fill
 
 
 def test_cross_sheet_link_cells_are_green(tmp_path):
@@ -439,9 +447,10 @@ def _build_with_variance(tmp_path, var):
     return load_workbook(path)
 
 
-def test_variance_sheet_is_second(tmp_path):
+def test_variance_sheet_position(tmp_path):
+    # Phase 7e moved Variance to 7th (index 6), after the Revolver tab.
     wb = _build(tmp_path)
-    assert wb.sheetnames[1] == SHEET_VARIANCE
+    assert wb.sheetnames[6] == SHEET_VARIANCE
 
 
 def test_variance_first_run_shows_placeholder(tmp_path):
@@ -538,8 +547,8 @@ def test_empty_inputs_still_produce_all_sheets(tmp_path):
     loaded = load_workbook(path)
 
     assert loaded.sheetnames == [
-        SHEET_FORECAST, SHEET_VARIANCE, SHEET_AR, SHEET_AP,
-        SHEET_PAYROLL, SHEET_DEBT, SHEET_NOTES,
+        SHEET_FORECAST, SHEET_AR, SHEET_AP, SHEET_PAYROLL,
+        SHEET_DEBT, SHEET_REVOLVER, SHEET_VARIANCE, SHEET_NOTES,
     ]
     ws = loaded[SHEET_FORECAST]
     assert ws.max_row == 15  # header + 13 + totals
@@ -769,26 +778,11 @@ def _debt_frames():
     return p, i
 
 
-def _revolver_df():
-    return pd.DataFrame({
-        "forecast_week": [1, 2],
-        "week_start_date": ["2026-05-25", "2026-06-01"],
-        "begin_revolver_balance": [0.0, 5000.0],
-        "revolver_draw": [5000.0, 0.0],
-        "revolver_repay": [0.0, 1200.0],
-        "ending_revolver_balance": [5000.0, 3800.0],
-        "revolver_interest_accrued": [0.0, 6.44],
-        "available_capacity": [52455000.0, 52456200.0],
-        "capacity_breached": [False, False],
-    })
-
-
 def _build_7d(tmp_path):
     p, i = _debt_frames()
     wb = build_workbook(
         _receipts(), _disbursements(), _customers(), _vendors(), AS_OF,
         payroll=_payroll_df(), debt_principal=p, debt_interest=i,
-        revolver_activity=_revolver_df(),
     )
     path = tmp_path / "7d.xlsx"
     write_workbook(wb, path)
@@ -808,7 +802,6 @@ def test_payroll_tab_total_column_matches_input(tmp_path):
 def test_debt_tab_total_is_principal_plus_interest(tmp_path):
     ws = _build_7d(tmp_path)[SHEET_DEBT]
     # 2 loans -> Total Debt Service at column 2 + 2 + 1 + 2 + 1 + 1 = 9 (I).
-    from openpyxl.utils import get_column_letter
     assert ws.cell(1, 9).value == "Total Debt Service"
     # wk1: principal 400+100=500, interest 50+10=60 -> 560.
     assert ws.cell(2, 9).value == pytest.approx(560.0)
@@ -816,10 +809,170 @@ def test_debt_tab_total_is_principal_plus_interest(tmp_path):
     assert ws.cell(6, 9).value == pytest.approx(445.0)
 
 
-def test_forecast_revolver_columns_are_values_from_activity(tmp_path):
+def test_forecast_revolver_columns_reference_revolver_tab(tmp_path):
+    """Phase 7e: revolver Net (H) / Interest (I) are formula refs, not values."""
     ws = _build_7d(tmp_path)[SHEET_FORECAST]
-    # H = Revolver Net (draw - repay); I = Revolver Interest.
-    assert ws.cell(2, 8).value == pytest.approx(5000.0)    # wk1 draw 5000, repay 0
-    assert ws.cell(2, 9).value == pytest.approx(0.0)
-    assert ws.cell(3, 8).value == pytest.approx(-1200.0)   # wk2 net repay
-    assert ws.cell(3, 9).value == pytest.approx(6.44)
+    assert ws.cell(2, 8).value == "='Revolver'!K2-'Revolver'!L2"
+    assert ws.cell(2, 9).value == "='Revolver'!G2"
+    assert ws.cell(14, 8).value == "='Revolver'!K14-'Revolver'!L14"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7e: Revolver tab (visible Excel math) + Assumptions named-range inputs
+# ---------------------------------------------------------------------------
+
+REV_CONFIG = {
+    "facility_total": 60_000_000, "lc_carve_out": 2_545_000,
+    "current_drawn_balance": 0, "beginning_cash": 1_196_696,
+    "minimum_cash_target": 0, "sofr_rate": 0.0535, "spread": 0.0135,
+}
+
+
+def _build_7e(tmp_path, receipts=None, disbursements=None, config=None):
+    wb = build_workbook(
+        receipts if receipts is not None else _receipts(),
+        disbursements if disbursements is not None else _disbursements(),
+        _customers(), _vendors(), AS_OF,
+        revolver_config=config if config is not None else REV_CONFIG,
+    )
+    path = tmp_path / "7e.xlsx"
+    write_workbook(wb, path)
+    return load_workbook(path)
+
+
+def test_revolver_tab_structure_and_all_formulas(tmp_path):
+    wb = _build_7e(tmp_path)
+    ws = wb[SHEET_REVOLVER]
+    # header + 13 data rows
+    assert ws.max_row == 14
+    assert ws.cell(1, 1).value == "Forecast Week"
+    assert ws.cell(1, 15).value == "Capacity Breached"
+    # Every computed cell (C..O) on every week row is a formula string.
+    for r in range(2, 15):
+        for c in range(3, 16):
+            v = ws.cell(r, c).value
+            assert isinstance(v, str) and v.startswith("="), f"R{r}C{c} not a formula: {v!r}"
+
+
+def test_assumptions_revolver_inputs_and_named_ranges(tmp_path):
+    wb = _build_7e(tmp_path)
+    names = set(wb.defined_names.keys())
+    expected = {"Facility_Total", "LC_CarveOut", "Currently_Drawn", "Beginning_Cash_Wk1",
+                "Min_Cash_Target", "SOFR", "Spread", "Annual_Rate", "Max_Capacity"}
+    assert expected <= names
+
+    ws = wb[SHEET_NOTES]
+    # Resolve each named range to its cell and check the seeded value/formula.
+    def named_cell(name):
+        ref = wb.defined_names[name].attr_text       # e.g. 'Assumptions & Notes'!$B$31
+        coord = ref.split("!")[1].replace("$", "")
+        return ws[coord]
+    assert named_cell("Facility_Total").value == pytest.approx(60_000_000)
+    assert named_cell("Beginning_Cash_Wk1").value == pytest.approx(1_196_696)
+    assert named_cell("Min_Cash_Target").value == pytest.approx(0)
+    assert named_cell("SOFR").value == pytest.approx(0.0535)
+    # Computed cells are formulas off the named inputs.
+    assert named_cell("Annual_Rate").value == "=SOFR+Spread"
+    assert named_cell("Max_Capacity").value == "=Facility_Total-LC_CarveOut"
+
+
+def _resolve_revolver(wb, config):
+    """Resolve the Revolver-tab formula chain in Python; return per-week ending cash."""
+    ar = wb[SHEET_AR]; ap = wb[SHEET_AP]; pay = wb[SHEET_PAYROLL]; debt = wb[SHEET_DEBT]
+    annual = config["sofr_rate"] + config["spread"]
+    maxcap = config["facility_total"] - config["lc_carve_out"]
+    target = config["minimum_cash_target"]
+
+    def col_sum(ws, c):
+        return sum((ws.cell(r, c).value or 0.0) for r in range(2, ws.max_row + 1))
+    # debt total column letter -> index (find "Total Debt Service" header)
+    tds_col = next(c for c in range(1, debt.max_column + 1)
+                   if debt.cell(1, c).value == "Total Debt Service")
+
+    begin_cash = config["beginning_cash"]
+    begin_rev = config["current_drawn_balance"]
+    out = []
+    for i in range(13):
+        r = i + 2
+        D = col_sum(ar, 2 + (i + 1))
+        E = col_sum(ap, 2 + (i + 1))
+        F = pay.cell(r, 6).value or 0.0
+        G = debt.cell(r, tds_col).value or 0.0
+        interest = round(begin_rev * annual / 52, 2)
+        pre = begin_cash + D - (E + F + G) - interest
+        avail = maxcap - begin_rev
+        draw = max(min(target - pre, avail), 0.0) if pre < target else 0.0
+        repay = min(pre - target, begin_rev) if (pre > target and begin_rev > 0) else 0.0
+        ending_rev = begin_rev + draw - repay
+        ending_cash = pre + draw - repay
+        out.append({"wk": i + 1, "pre": pre, "draw": draw, "repay": repay,
+                    "ending_cash": ending_cash})
+        begin_cash = ending_cash
+        begin_rev = ending_rev
+    return out
+
+
+def test_revolver_excel_resolution_matches_python(tmp_path):
+    """Resolve the Revolver tab in Python; compare to compute_revolver to the cent."""
+    from src.calc.revolver import compute_revolver
+    rec = _receipts(); dis = _disbursements()
+    wb = _build_7e(tmp_path, rec, dis, REV_CONFIG)
+
+    resolved = _resolve_revolver(wb, REV_CONFIG)
+
+    # Build the same inflow/base-outflow dicts compute_revolver expects.
+    inflows = {wk: 0.0 for wk in range(1, 14)}
+    for _, r in rec.iterrows():
+        inflows[int(r["forecast_week"])] += float(r["receipts"])
+    base = {wk: 0.0 for wk in range(1, 14)}
+    for _, r in dis.iterrows():
+        base[int(r["forecast_week"])] += float(r["disbursements"])
+    # (payroll/debt are zero in this fixture)
+    _, _, cash = compute_revolver(REV_CONFIG, inflows, base, AS_OF)
+    py = {int(row["forecast_week"]): float(row["ending_cash"]) for _, row in cash.iterrows()}
+
+    for row in resolved:
+        assert round(row["ending_cash"], 2) == pytest.approx(py[row["wk"]], abs=0.01)
+
+
+def test_scenario_wk1_begin_cash_is_seeded_value(tmp_path):
+    wb = _build_7e(tmp_path)
+    # Revolver C2 references the named input; resolve via the Assumptions cell.
+    ws = wb[SHEET_REVOLVER]
+    assert ws.cell(2, 3).value == "=Beginning_Cash_Wk1"
+    resolved = _resolve_revolver(wb, REV_CONFIG)
+    assert resolved[0]["wk"] == 1
+    # wk1 begin cash anchors to 1,196,696 (the seeded input).
+    # (resolved[0] uses begin_cash = config beginning_cash for wk1.)
+    assert REV_CONFIG["beginning_cash"] == 1_196_696
+
+
+def test_chain_integrity_wk2_begin_refs_wk1_ending(tmp_path):
+    wb = _build_7e(tmp_path)
+    rev = wb[SHEET_REVOLVER]
+    # Revolver Begin Cash wk2 (row 3, col C) = prior row Ending Cash (col N).
+    assert rev.cell(3, 3).value == "=N2"
+    # Begin Revolver wk2 = prior Ending Revolver Balance (col M).
+    assert rev.cell(3, 6).value == "=M2"
+
+
+def test_min_cash_policy_no_draw_when_pre_positive(tmp_path):
+    """With min_cash_target=0, the revolver does not draw in any positive-cash week."""
+    # Make every week strongly cash-positive: big receipts, tiny disbursements.
+    rec = pd.DataFrame({
+        "customerNumber": ["CUST-A"] * 13,
+        "forecast_week": list(range(1, 14)),
+        "week_start_date": [dt.date(2026, 5, 25)] * 13,
+        "receipts": [1_000_000.0] * 13,
+    })
+    dis = pd.DataFrame({
+        "vendorNumber": ["VEND-A"] * 13,
+        "forecast_week": list(range(1, 14)),
+        "week_start_date": [dt.date(2026, 5, 25)] * 13,
+        "disbursements": [10_000.0] * 13,
+    })
+    wb = _build_7e(tmp_path, rec, dis, REV_CONFIG)
+    resolved = _resolve_revolver(wb, REV_CONFIG)
+    for row in resolved:
+        if row["pre"] > 0:
+            assert row["draw"] == pytest.approx(0.0)

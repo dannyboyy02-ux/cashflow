@@ -50,6 +50,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.worksheet import Worksheet
 
 from src.config import (
@@ -75,6 +76,7 @@ from src.calc.po_payments_timing import (
     SOURCE_STREAM_RBNI,
     SOURCE_STREAM_OUTSTANDING,
 )
+from src.calc.revolver import load_revolver_config
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,29 @@ SHEET_AR = "AR by Customer"
 SHEET_AP = "AP by Vendor"
 SHEET_PAYROLL = "Payroll"
 SHEET_DEBT = "Debt Service"
+SHEET_REVOLVER = "Revolver"
 SHEET_NOTES = "Assumptions & Notes"
+
+# Revolver-input seed values used to build the Assumptions "Revolver Inputs"
+# block + named ranges when no live config is supplied (mirrors the keys in
+# inputs/revolver_config.json).
+REVOLVER_INPUT_DEFAULTS = {
+    "facility_total": 60_000_000,
+    "lc_carve_out": 2_545_000,
+    "current_drawn_balance": 0,
+    "beginning_cash": 1_196_696,
+    "minimum_cash_target": 0,
+    "sofr_rate": 0.0535,
+    "spread": 0.0135,
+}
+
+# Revolver-tab column letters (1 row per forecast week). The Forecast sheet and
+# the revolver-tab builder both reference these so the cross-sheet links agree.
+REV_COL_BEGIN_CASH = "C"
+REV_COL_INTEREST = "G"
+REV_COL_DRAW = "K"
+REV_COL_REPAY = "L"
+REV_COL_ENDING_CASH = "N"
 
 VARIANCE_PLACEHOLDER = (
     "No prior forecast available for comparison. "
@@ -155,7 +179,6 @@ def load_inputs() -> dict[str, pd.DataFrame]:
         "payroll": _load_optional("payroll_by_week"),
         "debt_principal": _load_optional("debt_principal_by_week"),
         "debt_interest": _load_optional("debt_interest_by_week"),
-        "revolver_activity": _load_optional("revolver_activity_by_week"),
     }
 
 
@@ -254,30 +277,25 @@ def _build_forecast_sheet(
     ar_data_rows: int,
     ap_data_rows: int,
     debt_total_col: str = "O",
-    revolver_activity: Optional[pd.DataFrame] = None,
 ) -> None:
-    """Headline 11-column forecast (Phase 7d layout):
+    """Headline 11-column forecast summary (Phase 7e -- pure formula view):
     A  Forecast Week
     B  Week Start
-    C  Beginning Cash          (input wk1, =K{r-1} thereafter)
+    C  Beginning Cash          (='Revolver'!C{r}  -- revolver tab Begin Cash)
     D  AR + SO Receipts        (cross-sheet SUM from 'AR by Customer')
     E  AP + PO Disbursements   (cross-sheet SUM from 'AP by Vendor')
     F  Payroll                 (cross-sheet ref to 'Payroll' Total, same row)
     G  Debt Service            (cross-sheet ref to 'Debt Service' Total, same row)
-    H  Revolver Net            (draw - repay; positive = net draw; value)
-    I  Revolver Interest       (value)
+    H  Revolver Net            (='Revolver'!K{r}-'Revolver'!L{r}  -- draw - repay)
+    I  Revolver Interest       (='Revolver'!G{r})
     J  Net Cash Flow           (=D-E-F-G+H-I)
-    K  Ending Cash             (=C+J)
+    K  Ending Cash             (='Revolver'!N{r}  -- revolver tab Ending Cash)
 
-    AR/AP use =SUM over all entity rows so new sources (SO, PO) are captured
-    automatically. The Payroll and Debt Service detail tabs are VERTICAL (weeks
-    as rows) and share this sheet's row convention -- week `wk` is on row
-    wk+1 = r on both -- so the references are same-row: 'Payroll'!F{r} (Total
-    Payroll) and 'Debt Service'!{debt_total_col}{r} (Total Debt Service, whose
-    column the debt-sheet builder returns since it depends on loan count).
-    Revolver values are written as computed numbers (the sequential plug cannot
-    be reproduced by an Excel formula). Only week-1 Beginning Cash is a user
-    input (blue on yellow); everything else is a formula or computed value.
+    EVERY cell is a formula -- there are no static revolver values anywhere on
+    this sheet (Phase 7e). The revolver math is visible on the Revolver tab and
+    referenced here; Beginning/Ending cash come straight from the Revolver tab,
+    so clicking any of those cells traces into the plug logic. AR/AP use =SUM
+    over all entity rows; Payroll/Debt reference their detail tabs same-row.
     """
     headers = [
         "Forecast Week", "Week Start", "Beginning Cash",
@@ -292,19 +310,11 @@ def _build_forecast_sheet(
     week_1_monday = monday_of_week(as_of_date)
     ar_last = 1 + ar_data_rows if ar_data_rows > 0 else 2
     ap_last = 1 + ap_data_rows if ap_data_rows > 0 else 2
-
-    # Revolver activity lookup {forecast_week -> (net, interest)}
-    rev_net: dict[int, float] = {}
-    rev_int: dict[int, float] = {}
-    if revolver_activity is not None and not revolver_activity.empty:
-        for _, row in revolver_activity.iterrows():
-            wk = int(row["forecast_week"])
-            rev_net[wk] = round(float(row["revolver_draw"]) - float(row["revolver_repay"]), 2)
-            rev_int[wk] = round(float(row["revolver_interest_accrued"]), 2)
+    rev = f"'{SHEET_REVOLVER}'"
 
     for i in range(horizon_weeks):
         wk = i + 1
-        r = i + 2  # worksheet row (1 = header)
+        r = i + 2  # worksheet row (1 = header); matches the Revolver-tab row.
         week_start = week_1_monday + dt.timedelta(days=7 * i)
 
         ws.cell(row=r, column=1, value=wk).font = F_BASE
@@ -312,13 +322,8 @@ def _build_forecast_sheet(
         date_cell.number_format = DATE_FMT
         date_cell.font = F_BASE
 
-        # C: Beginning Cash — wk1 input (blue on yellow), others chain from K.
-        if wk == 1:
-            begin = ws.cell(row=r, column=3, value=0)
-            begin.fill = _INPUT_FILL
-            _money(begin, F_INPUT)
-        else:
-            _money(ws.cell(row=r, column=3, value=f"=K{r - 1}"))
+        # C: Beginning Cash — from the Revolver tab (its Begin Cash column).
+        _money(ws.cell(row=r, column=3, value=f"={rev}!{REV_COL_BEGIN_CASH}{r}"), F_LINK)
 
         # D/E: AR + SO Receipts / AP + PO Disbursements — cross-sheet SUM (green).
         wk_col = get_column_letter(2 + wk)   # C = wk1, D = wk2 … O = wk13
@@ -330,19 +335,19 @@ def _build_forecast_sheet(
         # F: Payroll — Total Payroll for this week (Payroll tab col F, same row).
         _money(ws.cell(row=r, column=6, value=f"='{SHEET_PAYROLL}'!F{r}"), F_LINK)
 
-        # G: Debt Service — Total Debt Service for this week (same row; the debt
-        # tab's total column depends on loan count and is passed in).
+        # G: Debt Service — Total Debt Service for this week (same row).
         _money(ws.cell(row=r, column=7, value=f"='{SHEET_DEBT}'!{debt_total_col}{r}"), F_LINK)
 
-        # H/I: Revolver Net and Interest — Python-computed sequential values.
-        _money(ws.cell(row=r, column=8, value=rev_net.get(wk, 0.0)))
-        _money(ws.cell(row=r, column=9, value=rev_int.get(wk, 0.0)))
+        # H/I: Revolver Net (draw - repay) and Interest — from the Revolver tab.
+        _money(ws.cell(row=r, column=8,
+                       value=f"={rev}!{REV_COL_DRAW}{r}-{rev}!{REV_COL_REPAY}{r}"), F_LINK)
+        _money(ws.cell(row=r, column=9, value=f"={rev}!{REV_COL_INTEREST}{r}"), F_LINK)
 
-        # J: Net Cash Flow = Receipts - all outflows + Revolver Net.
+        # J: Net Cash Flow = Receipts - all outflows + Revolver Net - Rev Interest.
         _money(ws.cell(row=r, column=10,
                        value=f"=D{r}-E{r}-F{r}-G{r}+H{r}-I{r}"))
-        # K: Ending Cash = Beginning + Net.
-        _money(ws.cell(row=r, column=11, value=f"=C{r}+J{r}"))
+        # K: Ending Cash — from the Revolver tab (its Ending Cash column).
+        _money(ws.cell(row=r, column=11, value=f"={rev}!{REV_COL_ENDING_CASH}{r}"), F_LINK)
 
     # Totals row (sums for all cash-movement columns; C and K not summed).
     tr = horizon_weeks + 2
@@ -774,6 +779,90 @@ def _build_ap_by_vendor_sheet(
 
 
 # ---------------------------------------------------------------------------
+# Revolver tab -- the plug, as VISIBLE Excel math (Phase 7e)
+# ---------------------------------------------------------------------------
+
+
+def _build_revolver_sheet(ws: Worksheet, as_of_date: dt.date, horizon_weeks: int) -> None:
+    """Sequential revolver plug rendered entirely in Excel formulas.
+
+    One row per forecast week (row r = week r-1, matching the Forecast and
+    detail tabs). Every computed cell is a formula referencing named-range
+    inputs (from the Assumptions Revolver Inputs block), the Forecast sheet
+    (Inflows / Base Outflows), and the prior row (sequential carry). Click any
+    cell to trace the math -- no static values.
+
+    Columns: A Forecast Week | B Week Start | C Begin Cash | D Inflows |
+    E Base Outflows | F Begin Revolver Balance | G Interest Accrued |
+    H Pre-Revolver Cash | I Min Cash Target | J Available Capacity | K Draw |
+    L Repay | M Ending Revolver Balance | N Ending Cash | O Capacity Breached.
+
+    Interest is ROUND()ed to the cent so the Excel result matches revolver.py
+    (which rounds interest the same way) to the penny.
+    """
+    headers = [
+        "Forecast Week", "Week Start", "Begin Cash", "Inflows", "Base Outflows",
+        "Begin Revolver Balance", "Interest Accrued", "Pre-Revolver Cash",
+        "Min Cash Target", "Available Capacity", "Draw", "Repay",
+        "Ending Revolver Balance", "Ending Cash", "Capacity Breached",
+    ]
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+
+    week_1_monday = monday_of_week(as_of_date)
+    fc = f"'{SHEET_FORECAST}'"
+
+    for i in range(horizon_weeks):
+        wk = i + 1
+        r = i + 2
+        week_start = week_1_monday + dt.timedelta(days=7 * i)
+
+        ws.cell(row=r, column=1, value=wk).font = F_BASE
+        dcell = ws.cell(row=r, column=2, value=week_start)
+        dcell.number_format = DATE_FMT
+        dcell.font = F_BASE
+
+        # C Begin Cash: wk1 anchors to the input; later weeks chain off prior N.
+        c_begin = "=Beginning_Cash_Wk1" if wk == 1 else f"=N{r - 1}"
+        _money(ws.cell(row=r, column=3, value=c_begin))
+        # D Inflows / E Base Outflows: pulled from the Forecast summary row.
+        _money(ws.cell(row=r, column=4, value=f"={fc}!D{r}"), F_LINK)
+        _money(ws.cell(row=r, column=5, value=f"={fc}!E{r}+{fc}!F{r}+{fc}!G{r}"), F_LINK)
+        # F Begin Revolver: wk1 anchors to currently-drawn; later weeks chain off prior M.
+        f_begin = "=Currently_Drawn" if wk == 1 else f"=M{r - 1}"
+        _money(ws.cell(row=r, column=6, value=f_begin))
+        # G Interest Accrued (on opening balance), rounded to the cent.
+        _money(ws.cell(row=r, column=7, value=f"=ROUND(F{r}*Annual_Rate/52,2)"))
+        # H Pre-Revolver Cash.
+        _money(ws.cell(row=r, column=8, value=f"=C{r}+D{r}-E{r}-G{r}"))
+        # I Min Cash Target (per-row, for visibility).
+        _money(ws.cell(row=r, column=9, value="=Min_Cash_Target"))
+        # J Available Capacity.
+        _money(ws.cell(row=r, column=10, value=f"=Max_Capacity-F{r}"))
+        # K Draw: cover the shortfall to target, bounded by capacity.
+        _money(ws.cell(row=r, column=11,
+                       value=f"=IF(H{r}<I{r},MIN(I{r}-H{r},J{r}),0)"))
+        # L Repay: sweep excess above target, bounded by the outstanding balance.
+        _money(ws.cell(row=r, column=12,
+                       value=f"=IF(AND(H{r}>I{r},F{r}>0),MIN(H{r}-I{r},F{r}),0)"))
+        # M Ending Revolver Balance.
+        _money(ws.cell(row=r, column=13, value=f"=F{r}+K{r}-L{r}"))
+        # N Ending Cash.
+        _money(ws.cell(row=r, column=14, value=f"=H{r}+K{r}-L{r}"))
+        # O Capacity Breached flag.
+        breach = f'=IF(AND(H{r}<I{r},I{r}-H{r}>J{r}),"BREACHED","")'
+        bc = ws.cell(row=r, column=15, value=breach)
+        bc.font = F_BASE
+
+    ws.freeze_panes = "C2"
+    widths = {"A": 13, "B": 12}
+    for c in range(3, 15):
+        widths[get_column_letter(c)] = 16
+    widths["O"] = 16
+    _set_widths(ws, widths)
+
+
+# ---------------------------------------------------------------------------
 # Variance sheet -- today vs prior snapshot (week level)
 # ---------------------------------------------------------------------------
 
@@ -863,6 +952,7 @@ def _build_assumptions_sheet(
     as_of_date: dt.date,
     refresh_ts: Optional[dt.datetime],
     po_diagnostics: Optional[dict] = None,
+    revolver_config: Optional[dict] = None,
 ) -> None:
     refresh_str = refresh_ts.isoformat(sep=" ", timespec="seconds") if refresh_ts else "unknown"
     lines: list[tuple[str, bool]] = [
@@ -902,19 +992,17 @@ def _build_assumptions_sheet(
         ("", False),
         ("Caveats", True),
         (
-            "This is an automated forecast from current open AR/AP and historical "
-            "payment behavior. It does NOT yet include:",
+            "This is an automated forecast from current open AR/AP, open SO/PO, "
+            "payroll, debt service, and a revolver plug. It does NOT yet include:",
             False,
         ),
-        ("  - payroll", False),
-        ("  - debt service", False),
         ("  - capital expenditures", False),
         ("  - tax payments", False),
         ("  - new billings beyond current open AR / new POs beyond current open PO", False),
         ("", False),
-        ("Beginning Cash on the forecast sheet is a placeholder (0). Enter the", False),
-        ("actual week-1 starting bank balance and the Ending/Beginning chain", False),
-        ("recomputes the full 13-week cash position.", False),
+        ("Revolver math is visible on the Revolver tab (every cell a formula).", False),
+        ("Cash & revolver assumptions are the yellow input cells in the Revolver", False),
+        ("Inputs block below; edit them and the model recomputes on open.", False),
     ]
 
     # Phase 5 / PO Liabilities Diagnostic block. RBNI (received-but-not-invoiced)
@@ -952,7 +1040,51 @@ def _build_assumptions_sheet(
             cell.font = F_HEADER
         else:
             cell.font = F_BASE
+
+    # --- Revolver Inputs block: yellow input cells + workbook named ranges. ---
+    # Named ranges let downstream formulas read =Begin_Bal*Annual_Rate/52 rather
+    # than =Assumptions!$B$NN (the FP&A-standard pattern). Seeded from the live
+    # revolver config when supplied, else from REVOLVER_INPUT_DEFAULTS.
+    cfg = {**REVOLVER_INPUT_DEFAULTS, **(revolver_config or {})}
+    PCT_FMT = "0.00%"
+    sheet_q = f"'{SHEET_NOTES}'"
+    start = len(lines) + 2  # one blank gap after the text block
+
+    ws.cell(row=start, column=1, value="Revolver Inputs").font = F_HEADER
+    inputs = [
+        ("Facility Total", "Facility_Total", float(cfg["facility_total"]), CURRENCY_FMT),
+        ("LC Carve-out", "LC_CarveOut", float(cfg["lc_carve_out"]), CURRENCY_FMT),
+        ("Currently Drawn (wk0 anchor)", "Currently_Drawn", float(cfg["current_drawn_balance"]), CURRENCY_FMT),
+        ("Beginning Cash (wk1 anchor)", "Beginning_Cash_Wk1", float(cfg["beginning_cash"]), CURRENCY_FMT),
+        ("Minimum Cash Target", "Min_Cash_Target", float(cfg["minimum_cash_target"]), CURRENCY_FMT),
+        ("SOFR", "SOFR", float(cfg["sofr_rate"]), PCT_FMT),
+        ("Spread", "Spread", float(cfg["spread"]), PCT_FMT),
+    ]
+    row = start + 1
+    for label, name, value, fmt in inputs:
+        ws.cell(row=row, column=1, value=label).font = F_HEADER
+        cell = ws.cell(row=row, column=2, value=value)
+        cell.fill = _INPUT_FILL
+        cell.font = F_INPUT
+        cell.number_format = fmt
+        ws.parent.defined_names.add(DefinedName(name, attr_text=f"{sheet_q}!$B${row}"))
+        row += 1
+
+    # Computed cells (normal style, formulas off the named inputs).
+    ws.cell(row=row, column=1, value="Annual Rate").font = F_HEADER
+    ar_cell = ws.cell(row=row, column=2, value="=SOFR+Spread")
+    ar_cell.number_format = PCT_FMT
+    ar_cell.font = F_BASE
+    ws.parent.defined_names.add(DefinedName("Annual_Rate", attr_text=f"{sheet_q}!$B${row}"))
+    row += 1
+    ws.cell(row=row, column=1, value="Max Capacity").font = F_HEADER
+    mc_cell = ws.cell(row=row, column=2, value="=Facility_Total-LC_CarveOut")
+    mc_cell.number_format = CURRENCY_FMT
+    mc_cell.font = F_BASE
+    ws.parent.defined_names.add(DefinedName("Max_Capacity", attr_text=f"{sheet_q}!$B${row}"))
+
     ws.column_dimensions["A"].width = 100
+    ws.column_dimensions["B"].width = 18
 
 
 # ---------------------------------------------------------------------------
@@ -979,28 +1111,30 @@ def build_workbook(
     payroll: Optional[pd.DataFrame] = None,
     debt_principal: Optional[pd.DataFrame] = None,
     debt_interest: Optional[pd.DataFrame] = None,
-    revolver_activity: Optional[pd.DataFrame] = None,
+    revolver_config: Optional[dict] = None,
     horizon_weeks: int = FORECAST_HORIZON_WEEKS,
 ) -> Workbook:
-    """Build the seven-sheet forecast workbook (Phase 7d layout).
+    """Build the eight-sheet forecast workbook (Phase 7e layout).
 
-    Sheet order: 13-Week Forecast, Variance, AR by Customer, AP by Vendor,
-    Payroll, Debt Service, Assumptions & Notes.
+    Sheet order: 13-Week Forecast, AR by Customer, AP by Vendor, Payroll,
+    Debt Service, Revolver, Variance, Assumptions & Notes.
 
-    The detail sheets are built first so the Forecast sheet can size its
-    cross-sheet SUM/ref ranges to the actual entity and week-row counts.
-    AR/AP use combined views (SO + PO) when available; Payroll and Debt Service
-    are new vertical detail tabs; the Forecast references them by direct cell
-    ref. Revolver values are written as pre-computed numbers (sequential plug).
+    Every sheet is formula-driven. The revolver plug is now visible Excel math
+    on its own tab (referencing the Assumptions Revolver Inputs named ranges and
+    the Forecast Inflows/Outflows); the Forecast sheet's Beginning/Ending cash
+    and revolver columns reference the Revolver tab -- no static revolver values
+    anywhere. The Assumptions sheet is built last so its named ranges resolve
+    against the final layout.
     """
     wb = Workbook()
     ws_fc = wb.active
     ws_fc.title = SHEET_FORECAST
-    ws_var = wb.create_sheet(SHEET_VARIANCE)
     ws_ar = wb.create_sheet(SHEET_AR)
     ws_ap = wb.create_sheet(SHEET_AP)
     ws_pay = wb.create_sheet(SHEET_PAYROLL)
     ws_debt = wb.create_sheet(SHEET_DEBT)
+    ws_rev = wb.create_sheet(SHEET_REVOLVER)
+    ws_var = wb.create_sheet(SHEET_VARIANCE)
     ws_notes = wb.create_sheet(SHEET_NOTES)
 
     ar_long = combined if (combined is not None and not combined.empty) else receipts
@@ -1014,11 +1148,11 @@ def build_workbook(
     _build_payroll_sheet(ws_pay, payroll, horizon_weeks)
     debt_total_col = _build_debt_service_sheet(ws_debt, debt_principal, debt_interest, horizon_weeks)
     _build_forecast_sheet(
-        ws_fc, as_of_date, horizon_weeks, n_cust, n_vend,
-        debt_total_col=debt_total_col, revolver_activity=revolver_activity,
+        ws_fc, as_of_date, horizon_weeks, n_cust, n_vend, debt_total_col=debt_total_col,
     )
+    _build_revolver_sheet(ws_rev, as_of_date, horizon_weeks)
     _build_variance_sheet(ws_var, variance, horizon_weeks)
-    _build_assumptions_sheet(ws_notes, as_of_date, refresh_ts, po_diagnostics)
+    _build_assumptions_sheet(ws_notes, as_of_date, refresh_ts, po_diagnostics, revolver_config)
 
     return wb
 
@@ -1052,6 +1186,7 @@ def run(
     )
 
     po_diagnostics = po_liabilities_diagnostics(data["po_payments"])
+    revolver_config = load_revolver_config()
     wb = build_workbook(
         data["receipts"], data["disbursements"],
         data["customers"], data["vendors"],
@@ -1062,7 +1197,7 @@ def run(
         payroll=data["payroll"],
         debt_principal=data["debt_principal"],
         debt_interest=data["debt_interest"],
-        revolver_activity=data["revolver_activity"],
+        revolver_config=revolver_config,
     )
     saved = write_workbook(wb, output_path)
     logger.info("Wrote workbook to %s", saved)
