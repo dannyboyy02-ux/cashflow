@@ -502,7 +502,7 @@ if __name__ == "__main__":
     # combined_receipts needs AR+SO; combined_disbursements needs AP+PO; snapshot
     # needs both combined views. The SO/PO steps no-op cleanly when their inputs
     # are missing; variance no-ops on the first run (one snapshot date).
-    from src.calc import snapshot, variance, payroll, debt_service
+    from src.calc import snapshot, variance, payroll, debt_service, revolver
     run_receipts()
     run_so_receipts()
     run_combined_view()
@@ -514,5 +514,9 @@ if __name__ == "__main__":
     # disbursement steps. Rendering + variance integration come in a later phase.
     payroll.run()
     debt_service.run()
+    # Revolver is the capstone plug: it consumes ALL upstream weekly streams
+    # (receipts, disbursements, payroll, debt) and must run last among the calcs,
+    # before snapshot/variance. Nothing downstream depends on it yet (Phase 7d).
+    revolver.run()
     snapshot.run()
     variance.run()
