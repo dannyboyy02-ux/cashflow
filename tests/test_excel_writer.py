@@ -25,8 +25,10 @@ from src.output.excel_writer import (
     OUTPUT_FILENAME,
     SHEET_AP,
     SHEET_AR,
+    SHEET_DEBT,
     SHEET_FORECAST,
     SHEET_NOTES,
+    SHEET_PAYROLL,
     SHEET_VARIANCE,
     VARIANCE_PLACEHOLDER,
     build_workbook,
@@ -130,7 +132,8 @@ def test_run_writes_to_default_data_dir_filename(tmp_path):
 def test_all_sheets_exist_in_expected_order(tmp_path):
     wb = _build(tmp_path)
     assert wb.sheetnames == [
-        SHEET_FORECAST, SHEET_VARIANCE, SHEET_AR, SHEET_AP, SHEET_NOTES,
+        SHEET_FORECAST, SHEET_VARIANCE, SHEET_AR, SHEET_AP,
+        SHEET_PAYROLL, SHEET_DEBT, SHEET_NOTES,
     ]
 
 
@@ -180,11 +183,47 @@ def test_forecast_net_and_totals_are_formulas(tmp_path):
     wb = _build(tmp_path)
     ws = wb[SHEET_FORECAST]
 
-    assert ws.cell(row=2, column=6).value == "=D2-E2"
-    assert ws.cell(row=14, column=6).value == "=D14-E14"
+    # Net Cash Flow (col J) = receipts - disb - payroll - debt + rev_net - rev_int.
+    assert ws.cell(row=2, column=10).value == "=D2-E2-F2-G2+H2-I2"
+    assert ws.cell(row=14, column=10).value == "=D14-E14-F14-G14+H14-I14"
+    # Totals row sums each cash-movement column (D through J).
     assert ws.cell(row=15, column=4).value == "=SUM(D2:D14)"
-    assert ws.cell(row=15, column=5).value == "=SUM(E2:E14)"
-    assert ws.cell(row=15, column=6).value == "=SUM(F2:F14)"
+    assert ws.cell(row=15, column=7).value == "=SUM(G2:G14)"   # Debt Service
+    assert ws.cell(row=15, column=10).value == "=SUM(J2:J14)"  # Net Cash Flow
+
+
+def test_payroll_and_debt_columns_reference_detail_tabs(tmp_path):
+    """Forecast Payroll (F) / Debt Service (G) link to the detail tabs, same row.
+
+    Built with 5-loan debt data so Total Debt Service lands in the standard
+    column O (the live layout).
+    """
+    payroll = pd.DataFrame({
+        "forecast_week": [1], "week_start_date": ["2026-05-25"],
+        "gross_wages": [100.0], "employer_burden_pct": [0.12],
+        "total_payroll": [112.0], "source_stream": ["payroll"],
+    })
+    loans = [f"Loan {i}" for i in range(1, 6)]
+    debt_p = pd.DataFrame({
+        "forecast_week": [1] * 5, "week_start_date": ["2026-05-25"] * 5,
+        "loan_name": loans, "principal": [10.0] * 5, "source_stream": ["debt_principal"] * 5,
+    })
+    debt_i = pd.DataFrame({
+        "forecast_week": [1] * 5, "week_start_date": ["2026-05-25"] * 5,
+        "loan_name": loans, "interest": [1.0] * 5, "source_stream": ["debt_interest"] * 5,
+    })
+    wb = build_workbook(
+        _receipts(), _disbursements(), _customers(), _vendors(), AS_OF,
+        payroll=payroll, debt_principal=debt_p, debt_interest=debt_i,
+    )
+    path = tmp_path / "ref.xlsx"
+    write_workbook(wb, path)
+    ws = load_workbook(path)[SHEET_FORECAST]
+
+    assert ws.cell(row=2, column=6).value == "='Payroll'!F2"
+    assert ws.cell(row=2, column=7).value == "='Debt Service'!O2"
+    assert ws.cell(row=14, column=6).value == "='Payroll'!F14"
+    assert ws.cell(row=14, column=7).value == "='Debt Service'!O14"
 
 
 def test_beginning_ending_cash_use_formulas(tmp_path):
@@ -192,12 +231,12 @@ def test_beginning_ending_cash_use_formulas(tmp_path):
     wb = _build(tmp_path)
     ws = wb[SHEET_FORECAST]
 
-    # Week 1 beginning is the 0 placeholder; ending is a formula.
+    # Week 1 beginning is the 0 placeholder; ending (col K) = begin + net.
     assert ws.cell(row=2, column=3).value == 0
-    assert ws.cell(row=2, column=7).value == "=C2+F2"
-    # Week 2 beginning chains off week 1 ending.
-    assert ws.cell(row=3, column=3).value == "=G2"
-    assert ws.cell(row=3, column=7).value == "=C3+F3"
+    assert ws.cell(row=2, column=11).value == "=C2+J2"
+    # Week 2 beginning chains off week 1 ending cash (col K).
+    assert ws.cell(row=3, column=3).value == "=K2"
+    assert ws.cell(row=3, column=11).value == "=C3+J3"
 
 
 def test_entity_total_column_is_sum_formula(tmp_path):
@@ -488,8 +527,8 @@ def test_variance_missing_weeks_filled_with_zero(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_empty_inputs_still_produce_four_sheets(tmp_path):
-    """No receipts/disbursements -> valid workbook, formulas over empty ranges."""
+def test_empty_inputs_still_produce_all_sheets(tmp_path):
+    """No receipts/disbursements/payroll/debt -> valid workbook, formulas hold."""
     empty_rec = pd.DataFrame(columns=["customerNumber", "forecast_week", "week_start_date", "receipts"])
     empty_dis = pd.DataFrame(columns=["vendorNumber", "forecast_week", "week_start_date", "disbursements"])
 
@@ -499,13 +538,21 @@ def test_empty_inputs_still_produce_four_sheets(tmp_path):
     loaded = load_workbook(path)
 
     assert loaded.sheetnames == [
-        SHEET_FORECAST, SHEET_VARIANCE, SHEET_AR, SHEET_AP, SHEET_NOTES,
+        SHEET_FORECAST, SHEET_VARIANCE, SHEET_AR, SHEET_AP,
+        SHEET_PAYROLL, SHEET_DEBT, SHEET_NOTES,
     ]
     ws = loaded[SHEET_FORECAST]
     assert ws.max_row == 15  # header + 13 + totals
     # Totals are still formulas; detail SUM ranges collapse to an empty row-2 cell.
     assert ws.cell(row=15, column=4).value == "=SUM(D2:D14)"
     assert ws.cell(row=2, column=4).value == "=SUM('AR by Customer'!C2:C2)"
+    # Payroll / Debt detail tabs render with header + 13 weeks + totals row.
+    assert loaded[SHEET_PAYROLL].max_row == 15
+    assert loaded[SHEET_DEBT].max_row == 15
+    # Debt Service ref points at the detail tab, same row (column depends on
+    # loan count, which is 0 here, so don't hardcode it).
+    assert ws.cell(row=2, column=7).value.startswith("='Debt Service'!")
+    assert ws.cell(row=2, column=7).value.endswith("2")
     # Entity sheets have only their header row.
     assert loaded[SHEET_AR].max_row == 1
     assert loaded[SHEET_AP].max_row == 1
@@ -689,3 +736,90 @@ def test_assumptions_sheet_has_phase5_diagnostic_block(tmp_path):
     assert "$5,500" in text          # RBNI total
     assert "$7,500" in text          # phase 5 total
     assert "Item-only RBNI subtotal: $4,000" in text
+
+
+# ---------------------------------------------------------------------------
+# Phase 7d: Payroll / Debt Service detail tabs + revolver columns
+# ---------------------------------------------------------------------------
+
+
+def _payroll_df():
+    return pd.DataFrame({
+        "forecast_week": [1, 2, 3],
+        "week_start_date": ["2026-05-25", "2026-06-01", "2026-06-08"],
+        "gross_wages": [1000.0, 1000.0, 2000.0],
+        "employer_burden_pct": [0.12, 0.12, 0.12],
+        "total_payroll": [1120.0, 1120.0, 2240.0],
+        "source_stream": ["payroll"] * 3,
+    })
+
+
+def _debt_frames():
+    loans = ["Loan 1", "Loan 2"]
+    p = pd.DataFrame({
+        "forecast_week": [1, 1, 5], "week_start_date": ["2026-05-25", "2026-05-25", "2026-06-22"],
+        "loan_name": ["Loan 1", "Loan 2", "Loan 1"], "principal": [400.0, 100.0, 400.0],
+        "source_stream": ["debt_principal"] * 3,
+    })
+    i = pd.DataFrame({
+        "forecast_week": [1, 1, 5], "week_start_date": ["2026-05-25", "2026-05-25", "2026-06-22"],
+        "loan_name": ["Loan 1", "Loan 2", "Loan 1"], "interest": [50.0, 10.0, 45.0],
+        "source_stream": ["debt_interest"] * 3,
+    })
+    return p, i
+
+
+def _revolver_df():
+    return pd.DataFrame({
+        "forecast_week": [1, 2],
+        "week_start_date": ["2026-05-25", "2026-06-01"],
+        "begin_revolver_balance": [0.0, 5000.0],
+        "revolver_draw": [5000.0, 0.0],
+        "revolver_repay": [0.0, 1200.0],
+        "ending_revolver_balance": [5000.0, 3800.0],
+        "revolver_interest_accrued": [0.0, 6.44],
+        "available_capacity": [52455000.0, 52456200.0],
+        "capacity_breached": [False, False],
+    })
+
+
+def _build_7d(tmp_path):
+    p, i = _debt_frames()
+    wb = build_workbook(
+        _receipts(), _disbursements(), _customers(), _vendors(), AS_OF,
+        payroll=_payroll_df(), debt_principal=p, debt_interest=i,
+        revolver_activity=_revolver_df(),
+    )
+    path = tmp_path / "7d.xlsx"
+    write_workbook(wb, path)
+    return load_workbook(path)
+
+
+def test_payroll_tab_total_column_matches_input(tmp_path):
+    ws = _build_7d(tmp_path)[SHEET_PAYROLL]
+    assert ws.cell(1, 6).value == "Total Payroll"
+    # wk1 row 2, wk3 row 4
+    assert ws.cell(2, 6).value == pytest.approx(1120.0)
+    assert ws.cell(4, 6).value == pytest.approx(2240.0)
+    # weeks with no payroll data render as 0.
+    assert ws.cell(5, 6).value == pytest.approx(0.0)
+
+
+def test_debt_tab_total_is_principal_plus_interest(tmp_path):
+    ws = _build_7d(tmp_path)[SHEET_DEBT]
+    # 2 loans -> Total Debt Service at column 2 + 2 + 1 + 2 + 1 + 1 = 9 (I).
+    from openpyxl.utils import get_column_letter
+    assert ws.cell(1, 9).value == "Total Debt Service"
+    # wk1: principal 400+100=500, interest 50+10=60 -> 560.
+    assert ws.cell(2, 9).value == pytest.approx(560.0)
+    # wk5 (row 6): principal 400, interest 45 -> 445.
+    assert ws.cell(6, 9).value == pytest.approx(445.0)
+
+
+def test_forecast_revolver_columns_are_values_from_activity(tmp_path):
+    ws = _build_7d(tmp_path)[SHEET_FORECAST]
+    # H = Revolver Net (draw - repay); I = Revolver Interest.
+    assert ws.cell(2, 8).value == pytest.approx(5000.0)    # wk1 draw 5000, repay 0
+    assert ws.cell(2, 9).value == pytest.approx(0.0)
+    assert ws.cell(3, 8).value == pytest.approx(-1200.0)   # wk2 net repay
+    assert ws.cell(3, 9).value == pytest.approx(6.44)

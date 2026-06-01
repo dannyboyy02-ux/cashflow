@@ -1,14 +1,21 @@
 """Render the 13-week cash forecast into a CFO-facing Excel workbook.
 
-This is the first hand-off artifact: a single .xlsx the CFO can open and read
-without touching the pipeline. It reads the two bucketed tables produced by
-src.calc.bucketing (ar_receipts_by_week, ap_disbursements_by_week) plus the
-customer/vendor masters for display names, and writes four sheets:
+This is the CFO hand-off artifact: a single .xlsx that can be opened and read
+without touching the pipeline. It reads the bucketed weekly tables from SQLite
+plus the customer/vendor masters, and writes seven sheets (Phase 7d):
 
-  1. "13-Week Forecast"   -- the headline week-by-week cash view
-  2. "AR by Customer"     -- receipts pivoted to customer x week
-  3. "AP by Vendor"       -- disbursements pivoted to vendor x week
-  4. "Assumptions & Notes"-- as-of date, refresh stamp, methodology, caveats
+  1. "13-Week Forecast"    -- headline cash view: receipts, disbursements,
+                              payroll, debt service, revolver, ending cash
+  2. "Variance"            -- today vs prior snapshot (week level)
+  3. "AR by Customer"      -- receipts (AR + open-SO) pivoted to customer x week
+  4. "AP by Vendor"        -- disbursements (AP + open-PO) pivoted to vendor x week
+  5. "Payroll"             -- weekly payroll drill-down (gross, burden, total)
+  6. "Debt Service"        -- weekly per-loan principal + interest drill-down
+  7. "Assumptions & Notes" -- as-of date, refresh stamp, methodology, caveats
+
+The Forecast sheet's Payroll and Debt Service columns reference the matching
+week row on their detail tabs, so the headline figures are transparently
+traceable to their per-component build-up.
 
 FORMULAS, NOT HARDCODED VALUES (per the xlsx skill standard):
 
@@ -77,6 +84,8 @@ SHEET_FORECAST = "13-Week Forecast"
 SHEET_VARIANCE = "Variance"
 SHEET_AR = "AR by Customer"
 SHEET_AP = "AP by Vendor"
+SHEET_PAYROLL = "Payroll"
+SHEET_DEBT = "Debt Service"
 SHEET_NOTES = "Assumptions & Notes"
 
 VARIANCE_PLACEHOLDER = (
@@ -143,6 +152,10 @@ def load_inputs() -> dict[str, pd.DataFrame]:
         "combined": _load_optional(COMBINED_TABLE),
         "combined_disbursements": _load_optional(COMBINED_DISBURSEMENTS_TABLE),
         "po_payments": _load_optional(PO_PAYMENTS_TABLE),
+        "payroll": _load_optional("payroll_by_week"),
+        "debt_principal": _load_optional("debt_principal_by_week"),
+        "debt_interest": _load_optional("debt_interest_by_week"),
+        "revolver_activity": _load_optional("revolver_activity_by_week"),
     }
 
 
@@ -240,23 +253,38 @@ def _build_forecast_sheet(
     horizon_weeks: int,
     ar_data_rows: int,
     ap_data_rows: int,
+    debt_total_col: str = "O",
+    revolver_activity: Optional[pd.DataFrame] = None,
 ) -> None:
-    """Headline forecast. AR/AP columns are cross-sheet =SUM links; net, ending
-    cash, and totals are formulas. Only week-1 Beginning Cash is a hardcoded
-    (CFO-entered) input.
+    """Headline 11-column forecast (Phase 7d layout):
+    A  Forecast Week
+    B  Week Start
+    C  Beginning Cash          (input wk1, =K{r-1} thereafter)
+    D  AR + SO Receipts        (cross-sheet SUM from 'AR by Customer')
+    E  AP + PO Disbursements   (cross-sheet SUM from 'AP by Vendor')
+    F  Payroll                 (cross-sheet ref to 'Payroll' Total, same row)
+    G  Debt Service            (cross-sheet ref to 'Debt Service' Total, same row)
+    H  Revolver Net            (draw - repay; positive = net draw; value)
+    I  Revolver Interest       (value)
+    J  Net Cash Flow           (=D-E-F-G+H-I)
+    K  Ending Cash             (=C+J)
 
-    ar_data_rows / ap_data_rows are the count of detail rows on the AR/AP sheets,
-    used to build the cross-sheet SUM ranges. A count of 0 collapses to an empty
-    one-cell range (row 2) that sums to zero.
+    AR/AP use =SUM over all entity rows so new sources (SO, PO) are captured
+    automatically. The Payroll and Debt Service detail tabs are VERTICAL (weeks
+    as rows) and share this sheet's row convention -- week `wk` is on row
+    wk+1 = r on both -- so the references are same-row: 'Payroll'!F{r} (Total
+    Payroll) and 'Debt Service'!{debt_total_col}{r} (Total Debt Service, whose
+    column the debt-sheet builder returns since it depends on loan count).
+    Revolver values are written as computed numbers (the sequential plug cannot
+    be reproduced by an Excel formula). Only week-1 Beginning Cash is a user
+    input (blue on yellow); everything else is a formula or computed value.
     """
     headers = [
-        "Forecast Week",
-        "Week Start",
-        "Beginning Cash",
-        "AR Receipts",
-        "AP Disbursements",
-        "Net Cash Flow",
-        "Ending Cash",
+        "Forecast Week", "Week Start", "Beginning Cash",
+        "AR + SO Receipts", "AP + PO Disbursements",
+        "Payroll", "Debt Service",
+        "Revolver Net", "Revolver Interest",
+        "Net Cash Flow", "Ending Cash",
     ]
     ws.append(headers)
     _style_header_row(ws, len(headers))
@@ -264,6 +292,15 @@ def _build_forecast_sheet(
     week_1_monday = monday_of_week(as_of_date)
     ar_last = 1 + ar_data_rows if ar_data_rows > 0 else 2
     ap_last = 1 + ap_data_rows if ap_data_rows > 0 else 2
+
+    # Revolver activity lookup {forecast_week -> (net, interest)}
+    rev_net: dict[int, float] = {}
+    rev_int: dict[int, float] = {}
+    if revolver_activity is not None and not revolver_activity.empty:
+        for _, row in revolver_activity.iterrows():
+            wk = int(row["forecast_week"])
+            rev_net[wk] = round(float(row["revolver_draw"]) - float(row["revolver_repay"]), 2)
+            rev_int[wk] = round(float(row["revolver_interest_accrued"]), 2)
 
     for i in range(horizon_weeks):
         wk = i + 1
@@ -275,43 +312,52 @@ def _build_forecast_sheet(
         date_cell.number_format = DATE_FMT
         date_cell.font = F_BASE
 
-        # Beginning Cash: week 1 is the CFO's hand-entered starting balance
-        # (0 placeholder, blue text on yellow fill); later weeks chain off the
-        # prior week's Ending Cash.
+        # C: Beginning Cash — wk1 input (blue on yellow), others chain from K.
         if wk == 1:
             begin = ws.cell(row=r, column=3, value=0)
             begin.fill = _INPUT_FILL
             _money(begin, F_INPUT)
         else:
-            _money(ws.cell(row=r, column=3, value=f"=G{r - 1}"))
+            _money(ws.cell(row=r, column=3, value=f"=K{r - 1}"))
 
-        # AR Receipts / AP Disbursements: cross-sheet SUM of the matching week
-        # column on the detail sheets (green = link).
-        ar_col = get_column_letter(2 + wk)   # detail Week N is col 2+N (C..O)
-        ap_col = get_column_letter(2 + wk)
-        _money(
-            ws.cell(row=r, column=4, value=f"=SUM('{SHEET_AR}'!{ar_col}2:{ar_col}{ar_last})"),
-            F_LINK,
-        )
-        _money(
-            ws.cell(row=r, column=5, value=f"=SUM('{SHEET_AP}'!{ap_col}2:{ap_col}{ap_last})"),
-            F_LINK,
-        )
-        # Net Cash Flow and Ending Cash: same-sheet formulas (black).
-        _money(ws.cell(row=r, column=6, value=f"=D{r}-E{r}"))
-        _money(ws.cell(row=r, column=7, value=f"=C{r}+F{r}"))
+        # D/E: AR + SO Receipts / AP + PO Disbursements — cross-sheet SUM (green).
+        wk_col = get_column_letter(2 + wk)   # C = wk1, D = wk2 … O = wk13
+        _money(ws.cell(row=r, column=4,
+                       value=f"=SUM('{SHEET_AR}'!{wk_col}2:{wk_col}{ar_last})"), F_LINK)
+        _money(ws.cell(row=r, column=5,
+                       value=f"=SUM('{SHEET_AP}'!{wk_col}2:{wk_col}{ap_last})"), F_LINK)
 
-    # Totals row.
+        # F: Payroll — Total Payroll for this week (Payroll tab col F, same row).
+        _money(ws.cell(row=r, column=6, value=f"='{SHEET_PAYROLL}'!F{r}"), F_LINK)
+
+        # G: Debt Service — Total Debt Service for this week (same row; the debt
+        # tab's total column depends on loan count and is passed in).
+        _money(ws.cell(row=r, column=7, value=f"='{SHEET_DEBT}'!{debt_total_col}{r}"), F_LINK)
+
+        # H/I: Revolver Net and Interest — Python-computed sequential values.
+        _money(ws.cell(row=r, column=8, value=rev_net.get(wk, 0.0)))
+        _money(ws.cell(row=r, column=9, value=rev_int.get(wk, 0.0)))
+
+        # J: Net Cash Flow = Receipts - all outflows + Revolver Net.
+        _money(ws.cell(row=r, column=10,
+                       value=f"=D{r}-E{r}-F{r}-G{r}+H{r}-I{r}"))
+        # K: Ending Cash = Beginning + Net.
+        _money(ws.cell(row=r, column=11, value=f"=C{r}+J{r}"))
+
+    # Totals row (sums for all cash-movement columns; C and K not summed).
     tr = horizon_weeks + 2
-    last_data_row = horizon_weeks + 1
+    last = horizon_weeks + 1
     ws.cell(row=tr, column=1, value="TOTAL").font = F_HEADER
-    for col in (4, 5, 6):
+    for col in (4, 5, 6, 7, 8, 9, 10):   # D through J
         letter = get_column_letter(col)
-        cell = ws.cell(row=tr, column=col, value=f"=SUM({letter}2:{letter}{last_data_row})")
+        cell = ws.cell(row=tr, column=col, value=f"=SUM({letter}2:{letter}{last})")
         _money(cell, F_HEADER)
 
     ws.freeze_panes = "A2"
-    _set_widths(ws, {"A": 14, "B": 12, "C": 16, "D": 16, "E": 18, "F": 16, "G": 16})
+    _set_widths(ws, {
+        "A": 14, "B": 12, "C": 16, "D": 18, "E": 20,
+        "F": 14, "G": 14, "H": 14, "I": 18, "J": 16, "K": 16,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +439,194 @@ def _build_entity_sheet(
     widths[get_column_letter(total_col)] = 16
     _set_widths(ws, widths)
     return n_rows
+
+
+# ---------------------------------------------------------------------------
+# Payroll detail tab (vertical: weeks as rows, components as columns)
+# ---------------------------------------------------------------------------
+
+
+def _build_payroll_sheet(ws: Worksheet, payroll: Optional[pd.DataFrame], horizon_weeks: int) -> None:
+    """Payroll drill-down: one row per week showing gross wages, burden, total.
+
+    Week columns on this sheet are NOT the week-across format used by AR/AP
+    entity sheets; instead weeks are rows (13 data rows). The Forecast sheet
+    references the Total Payroll column (F) by row number.
+
+    Row layout (same week numbering as the Forecast sheet — row r = week r-1):
+      Row 1  : Header
+      Row 2  : Week 1 data  (r = wk + 1)
+      ...
+      Row 14 : Week 13 data
+      Row 15 : Totals
+    """
+    headers = [
+        "Forecast Week", "Week Start",
+        "Gross Wages", "Employer Burden %", "Employer Burden ($)", "Total Payroll",
+    ]
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+
+    by_week: dict[int, dict] = {}
+    if payroll is not None and not payroll.empty:
+        for _, row in payroll.iterrows():
+            by_week[int(row["forecast_week"])] = row.to_dict()
+
+    tot_gross = tot_burden = tot_total = 0.0
+    for i in range(horizon_weeks):
+        wk = i + 1
+        r = i + 2
+        row = by_week.get(wk, {})
+        gross = float(row.get("gross_wages", 0.0))
+        pct = float(row.get("employer_burden_pct", 0.0))
+        burden_amt = round(gross * pct, 2)
+        total = float(row.get("total_payroll", 0.0))
+        ws.cell(row=r, column=1, value=wk).font = F_BASE
+        ws_date = row.get("week_start_date")
+        if ws_date:
+            dc = ws.cell(row=r, column=2, value=_coerce_date(ws_date))
+            dc.number_format = DATE_FMT
+            dc.font = F_BASE
+        _money(ws.cell(row=r, column=3, value=gross))
+        pct_cell = ws.cell(row=r, column=4, value=pct)
+        pct_cell.number_format = "0.00%"
+        pct_cell.font = F_BASE
+        _money(ws.cell(row=r, column=5, value=burden_amt))
+        _money(ws.cell(row=r, column=6, value=total))   # ← Forecast col F refs this row
+        tot_gross += gross
+        tot_burden += burden_amt
+        tot_total += total
+
+    # Totals row.
+    tr = horizon_weeks + 2
+    ws.cell(row=tr, column=1, value="TOTAL").font = F_HEADER
+    for col, val in ((3, tot_gross), (5, tot_burden), (6, tot_total)):
+        cell = ws.cell(row=tr, column=col, value=round(val, 2))
+        _money(cell, F_HEADER)
+
+    ws.freeze_panes = "A2"
+    _set_widths(ws, {"A": 14, "B": 12, "C": 16, "D": 18, "E": 18, "F": 16})
+
+
+# ---------------------------------------------------------------------------
+# Debt Service detail tab (vertical: weeks as rows, loans as columns)
+# ---------------------------------------------------------------------------
+
+
+def _build_debt_service_sheet(
+    ws: Worksheet,
+    debt_principal: Optional[pd.DataFrame],
+    debt_interest: Optional[pd.DataFrame],
+    horizon_weeks: int,
+) -> str:
+    """Debt service drill-down showing per-loan principal, per-loan interest,
+    and a Total Debt Service column (referenced by the Forecast sheet). Returns
+    the column letter of the Total Debt Service column (depends on loan count;
+    column O for the standard 5 loans).
+
+    Column layout (per-week rows; row r = wk + 1 matching Payroll tab):
+      A  Forecast Week   B  Week Start
+      C-G  Loan 1-5 Principal    H  Total Principal
+      I-M  Loan 1-5 Interest     N  Total Interest
+      O  Total Debt Service   ← Forecast col G references this
+    """
+    # Gather sorted loan names from whichever table has data.
+    loan_names: list[str] = []
+    for df in (debt_principal, debt_interest):
+        if df is not None and not df.empty and "loan_name" in df.columns:
+            for ln in df["loan_name"].dropna().unique():
+                if ln not in loan_names:
+                    loan_names.append(ln)
+    loan_names = sorted(loan_names)
+    n_loans = len(loan_names) if loan_names else 0
+
+    # Build {week -> {loan_name -> principal/interest}}
+    def _by_week_loan(df, val_col):
+        result: dict[int, dict[str, float]] = {wk: {} for wk in range(1, horizon_weeks + 1)}
+        if df is None or df.empty:
+            return result
+        for _, row in df.iterrows():
+            wk = int(row["forecast_week"])
+            if 1 <= wk <= horizon_weeks:
+                result[wk][str(row["loan_name"])] = float(row[val_col])
+        return result
+
+    prin_data = _by_week_loan(debt_principal, "principal")
+    int_data = _by_week_loan(debt_interest, "interest")
+
+    # Build headers (dynamic on loan count, but expect 5 loans).
+    p_cols = [f"{ln} Principal" for ln in loan_names] if loan_names else ["Principal"]
+    i_cols = [f"{ln} Interest" for ln in loan_names] if loan_names else ["Interest"]
+    headers = (["Forecast Week", "Week Start"]
+               + p_cols + ["Total Principal"]
+               + i_cols + ["Total Interest", "Total Debt Service"])
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+
+    n_p = max(n_loans, 1)   # columns for principal
+    n_i = max(n_loans, 1)   # columns for interest
+    # column index offsets (1-based):
+    #  A=1, B=2, C=3 .. C+n_p-1 = principal per loan
+    #  C+n_p = Total Principal
+    #  C+n_p+1 .. C+n_p+n_i = interest per loan
+    #  C+n_p+n_i+1 = Total Interest
+    #  C+n_p+n_i+2 = Total Debt Service  ← col O for 5 loans (= col 16)
+    tp_col = 2 + n_p + 1       # Total Principal
+    ti_col = tp_col + n_i + 1  # Total Interest
+    tds_col = ti_col + 1       # Total Debt Service (Forecast col G references this)
+
+    tot_principal = tot_interest = 0.0
+    for i in range(horizon_weeks):
+        wk = i + 1
+        r = i + 2
+        ws.cell(row=r, column=1, value=wk).font = F_BASE
+
+        # Grab week_start_date from whichever table has it.
+        wsd = None
+        for df in (debt_principal, debt_interest):
+            if df is not None and not df.empty:
+                rows_wk = df[df["forecast_week"] == wk]
+                if not rows_wk.empty:
+                    wsd = rows_wk.iloc[0]["week_start_date"]
+                    break
+        if wsd:
+            dc = ws.cell(row=r, column=2, value=_coerce_date(wsd))
+            dc.number_format = DATE_FMT
+            dc.font = F_BASE
+
+        # Per-loan principal.
+        week_p = sum_p = 0.0
+        for j, ln in enumerate(loan_names):
+            v = prin_data[wk].get(ln, 0.0)
+            _money(ws.cell(row=r, column=3 + j, value=v))
+            sum_p += v
+        _money(ws.cell(row=r, column=tp_col, value=round(sum_p, 2)), F_HEADER if sum_p else F_BASE)
+
+        # Per-loan interest.
+        sum_i = 0.0
+        for j, ln in enumerate(loan_names):
+            v = int_data[wk].get(ln, 0.0)
+            _money(ws.cell(row=r, column=tp_col + 1 + j, value=v))
+            sum_i += v
+        _money(ws.cell(row=r, column=ti_col, value=round(sum_i, 2)), F_HEADER if sum_i else F_BASE)
+
+        # Total Debt Service  ← Forecast sheet references this column.
+        tds = round(sum_p + sum_i, 2)
+        _money(ws.cell(row=r, column=tds_col, value=tds), F_HEADER if tds else F_BASE)
+        tot_principal += sum_p
+        tot_interest += sum_i
+
+    # Totals row.
+    tr = horizon_weeks + 2
+    ws.cell(row=tr, column=1, value="TOTAL").font = F_HEADER
+    _money(ws.cell(row=tr, column=tp_col, value=round(tot_principal, 2)), F_HEADER)
+    _money(ws.cell(row=tr, column=ti_col, value=round(tot_interest, 2)), F_HEADER)
+    _money(ws.cell(row=tr, column=tds_col, value=round(tot_principal + tot_interest, 2)), F_HEADER)
+
+    ws.freeze_panes = "C2"
+    _set_widths(ws, {"A": 12, "B": 12,
+                     **{get_column_letter(3 + j): 14 for j in range(n_p + n_i + 3)}})
+    return get_column_letter(tds_col)
 
 
 # ---------------------------------------------------------------------------
@@ -742,26 +976,31 @@ def build_workbook(
     combined: Optional[pd.DataFrame] = None,
     combined_disbursements: Optional[pd.DataFrame] = None,
     po_diagnostics: Optional[dict] = None,
+    payroll: Optional[pd.DataFrame] = None,
+    debt_principal: Optional[pd.DataFrame] = None,
+    debt_interest: Optional[pd.DataFrame] = None,
+    revolver_activity: Optional[pd.DataFrame] = None,
     horizon_weeks: int = FORECAST_HORIZON_WEEKS,
 ) -> Workbook:
-    """Build the five-sheet forecast workbook from the bucketed inputs.
+    """Build the seven-sheet forecast workbook (Phase 7d layout).
 
     Sheet order: 13-Week Forecast, Variance, AR by Customer, AP by Vendor,
-    Assumptions & Notes. The detail sheets are populated first so the forecast
-    sheet can size its cross-sheet SUM ranges to the actual entity row counts.
+    Payroll, Debt Service, Assumptions & Notes.
 
-    The AR-by-Customer sheet uses combined_receipts_by_week (open-AR + open-SO)
-    and the AP-by-Vendor sheet uses combined_disbursements_by_week (open-AP +
-    open-PO RBNI/outstanding) when available, so the headline forecast fills past
-    the wk-6 cliff on both sides; each falls back to the AR-only / AP-only table
-    if its combined view is missing/empty, with no error.
+    The detail sheets are built first so the Forecast sheet can size its
+    cross-sheet SUM/ref ranges to the actual entity and week-row counts.
+    AR/AP use combined views (SO + PO) when available; Payroll and Debt Service
+    are new vertical detail tabs; the Forecast references them by direct cell
+    ref. Revolver values are written as pre-computed numbers (sequential plug).
     """
     wb = Workbook()
     ws_fc = wb.active
     ws_fc.title = SHEET_FORECAST
-    ws_var = wb.create_sheet(SHEET_VARIANCE)   # second sheet, by the headline
+    ws_var = wb.create_sheet(SHEET_VARIANCE)
     ws_ar = wb.create_sheet(SHEET_AR)
     ws_ap = wb.create_sheet(SHEET_AP)
+    ws_pay = wb.create_sheet(SHEET_PAYROLL)
+    ws_debt = wb.create_sheet(SHEET_DEBT)
     ws_notes = wb.create_sheet(SHEET_NOTES)
 
     ar_long = combined if (combined is not None and not combined.empty) else receipts
@@ -772,7 +1011,12 @@ def build_workbook(
     )
     n_cust = _build_ar_by_customer_sheet(ws_ar, ar_long, customers, horizon_weeks)
     n_vend = _build_ap_by_vendor_sheet(ws_ap, ap_long, vendors, horizon_weeks)
-    _build_forecast_sheet(ws_fc, as_of_date, horizon_weeks, n_cust, n_vend)
+    _build_payroll_sheet(ws_pay, payroll, horizon_weeks)
+    debt_total_col = _build_debt_service_sheet(ws_debt, debt_principal, debt_interest, horizon_weeks)
+    _build_forecast_sheet(
+        ws_fc, as_of_date, horizon_weeks, n_cust, n_vend,
+        debt_total_col=debt_total_col, revolver_activity=revolver_activity,
+    )
     _build_variance_sheet(ws_var, variance, horizon_weeks)
     _build_assumptions_sheet(ws_notes, as_of_date, refresh_ts, po_diagnostics)
 
@@ -815,6 +1059,10 @@ def run(
         variance=data["variance"], combined=data["combined"],
         combined_disbursements=data["combined_disbursements"],
         po_diagnostics=po_diagnostics,
+        payroll=data["payroll"],
+        debt_principal=data["debt_principal"],
+        debt_interest=data["debt_interest"],
+        revolver_activity=data["revolver_activity"],
     )
     saved = write_workbook(wb, output_path)
     logger.info("Wrote workbook to %s", saved)
