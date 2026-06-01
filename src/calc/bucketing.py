@@ -70,6 +70,20 @@ COMBINED_TABLE = "combined_receipts_by_week"
 SOURCE_AR = "open_ar"
 SOURCE_SO = "open_so"
 
+# Open-PO side: timed PO liabilities (RBNI + outstanding) bucketed onto the same
+# grid as ap_disbursements_by_week. The bucket key carries source_stream so each
+# week keeps po_rbni and po_outstanding separate.
+PO_INPUT_TABLE = "po_open_with_expected_payment"
+PO_OUTPUT_TABLE = "po_payments_by_week"
+PO_DATE_COL = "expected_payment_date"
+PO_VALUE_COL = "amount"
+PO_AGG_COL = "disbursements"
+
+# Union of AP + PO weekly disbursements with a source discriminator. AP rows are
+# tagged open_ap; PO rows keep their own source_stream (po_rbni, po_outstanding).
+COMBINED_DISBURSEMENTS_TABLE = "combined_disbursements_by_week"
+SOURCE_AP = "open_ap"
+
 # Backwards-compatible alias: the original single-purpose constant name.
 OUTPUT_TABLE = AR_OUTPUT_TABLE
 
@@ -232,6 +246,59 @@ def build_combined_receipts(
     return pd.concat(parts, ignore_index=True)
 
 
+def bucket_po_payments(
+    po_stamped: pd.DataFrame,
+    as_of: dt.date,
+    horizon_weeks: int = FORECAST_HORIZON_WEEKS,
+) -> pd.DataFrame:
+    """Bucket timed PO disbursements onto the 13-week grid, keyed by source_stream.
+
+    Unlike the single-entity aggregates, the group key includes source_stream so
+    each (vendor, week) keeps its po_rbni and po_outstanding amounts as separate
+    rows. Returns (vendorNumber, source_stream, forecast_week, week_start_date,
+    disbursements).
+    """
+    stamped_with_weeks = assign_forecast_week(po_stamped, as_of, date_col=PO_DATE_COL)
+    in_horizon = stamped_with_weeks[
+        (stamped_with_weeks["forecast_week"] >= 1)
+        & (stamped_with_weeks["forecast_week"] <= horizon_weeks)
+    ]
+    agg = (
+        in_horizon
+        .groupby(
+            ["vendorNumber", "source_stream", "forecast_week", "week_start_date"],
+            as_index=False,
+        )[PO_VALUE_COL]
+        .sum()
+        .rename(columns={PO_VALUE_COL: PO_AGG_COL})
+    )
+    return agg
+
+
+def build_combined_disbursements(
+    ap_by_week: pd.DataFrame,
+    po_by_week: pd.DataFrame,
+) -> pd.DataFrame:
+    """Union AP (source=open_ap) and PO (source=po_rbni/po_outstanding) disbursements.
+
+    Does NOT mutate the inputs; additive only. AP rows gain source=open_ap; PO
+    rows keep their existing source_stream values (renamed to the shared 'source'
+    column). Mirrors build_combined_receipts on the AP side.
+    """
+    cols = ["vendorNumber", "forecast_week", "week_start_date", "disbursements", "source"]
+    parts = []
+    if ap_by_week is not None and not ap_by_week.empty:
+        ap = ap_by_week.copy()
+        ap["source"] = SOURCE_AP
+        parts.append(ap[cols])
+    if po_by_week is not None and not po_by_week.empty:
+        po = po_by_week.rename(columns={"source_stream": "source"}).copy()
+        parts.append(po[cols])
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    return pd.concat(parts, ignore_index=True)
+
+
 def load_table(name: str) -> pd.DataFrame:
     """Read an entire SQLite table into a DataFrame."""
     with get_connection() as conn:
@@ -372,6 +439,51 @@ def run_combined_view() -> None:
     )
 
 
+def run_po_payments(
+    as_of_date: Optional[dt.date] = None,
+    horizon_weeks: int = FORECAST_HORIZON_WEEKS,
+) -> None:
+    """Bucket timed PO disbursements: load po_open_with_expected_payment, write.
+
+    Tolerant of a missing input table (PO file not refreshed): writes an empty
+    po_payments_by_week so the combined view and the rest of the pipeline run.
+    """
+    if as_of_date is None:
+        as_of_date = dt.date.today()
+    stamped = _load_optional(PO_INPUT_TABLE)
+    if stamped.empty:
+        logger.warning(
+            "%s is missing/empty; writing empty %s (no open-PO layer this run).",
+            PO_INPUT_TABLE, PO_OUTPUT_TABLE,
+        )
+        empty = pd.DataFrame(columns=[
+            "vendorNumber", "source_stream", "forecast_week", "week_start_date", PO_AGG_COL,
+        ])
+        write_to_sqlite(empty, PO_OUTPUT_TABLE)
+        return
+
+    agg = bucket_po_payments(stamped, as_of_date, horizon_weeks)
+    stamped_with_weeks = assign_forecast_week(stamped, as_of_date, date_col=PO_DATE_COL)
+    logger.info(
+        "PO payments bucketing summary: %s",
+        _summary(agg, stamped_with_weeks, horizon_weeks, as_of_date, PO_VALUE_COL),
+    )
+    n = write_to_sqlite(agg, PO_OUTPUT_TABLE)
+    logger.info("Wrote %d rows to SQLite table %s", n, PO_OUTPUT_TABLE)
+
+
+def run_combined_disbursements() -> None:
+    """Union AP + PO weekly disbursements into combined_disbursements_by_week."""
+    ap = _load_optional(AP_OUTPUT_TABLE)
+    po = _load_optional(PO_OUTPUT_TABLE)
+    combined = build_combined_disbursements(ap, po)
+    n = write_to_sqlite(combined, COMBINED_DISBURSEMENTS_TABLE)
+    logger.info(
+        "Wrote %d rows to SQLite table %s (AP=%d, PO=%d)",
+        n, COMBINED_DISBURSEMENTS_TABLE, len(ap), len(po),
+    )
+
+
 def run(
     as_of_date: Optional[dt.date] = None,
     horizon_weeks: int = FORECAST_HORIZON_WEEKS,
@@ -383,15 +495,19 @@ def run(
 
 
 if __name__ == "__main__":
-    run()
-    # Pipeline wiring (side effects live in __main__ so run() stays pure):
-    # AR bucketing -> SO bucketing -> combined view -> snapshot -> variance.
-    # A full daily refresh (python -m src.calc.bucketing) thus produces the
-    # weekly AR/AP/SO tables, the combined AR+SO receipts view, a dated snapshot,
-    # and today-vs-prior variance. run_so_receipts no-ops cleanly when the SO
-    # input is missing; variance no-ops on the first run (one snapshot date).
+    # Full daily pipeline in dependency order (side effects live in __main__ so
+    # run() stays the pure AR+AP bucketing core for programmatic callers):
+    #   AR -> SO -> combined_receipts -> AP -> PO -> combined_disbursements
+    #   -> snapshot -> variance
+    # combined_receipts needs AR+SO; combined_disbursements needs AP+PO; snapshot
+    # needs both combined views. The SO/PO steps no-op cleanly when their inputs
+    # are missing; variance no-ops on the first run (one snapshot date).
     from src.calc import snapshot, variance
+    run_receipts()
     run_so_receipts()
     run_combined_view()
+    run_disbursements()
+    run_po_payments()
+    run_combined_disbursements()
     snapshot.run()
     variance.run()

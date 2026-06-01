@@ -109,10 +109,12 @@ def append_snapshot(
     return len(df)
 
 
-# When present, the combined AR+SO receipts view is preferred as the AR-side
-# snapshot source, so the snapshot history (and the variance built from it)
-# captures open-SO movement, not just open-AR. Falls back to AR-only.
+# When present, the combined views are preferred as the snapshot sources, so the
+# snapshot history (and the variance built from it) captures open-SO movement on
+# the AR side and open-PO movement on the AP side, not just open-AR / open-AP.
+# Both fall back to the AR-only / AP-only table when the combined view is absent.
 COMBINED_SOURCE_TABLE = "combined_receipts_by_week"
+COMBINED_DISBURSEMENTS_SOURCE_TABLE = "combined_disbursements_by_week"
 
 
 def _ar_receipts_source() -> pd.DataFrame:
@@ -137,6 +139,29 @@ def _ar_receipts_source() -> pd.DataFrame:
     return load_table(AR_SOURCE_TABLE)
 
 
+def _ap_disbursements_source() -> pd.DataFrame:
+    """AP-side snapshot source: combined AP+PO disbursements if available, else AP-only.
+
+    Mirrors _ar_receipts_source: the combined view's per-source rows
+    (open_ap / po_rbni / po_outstanding) are summed back to one row per
+    (vendorNumber, forecast_week, week_start_date) so the snapshot schema is
+    unchanged whether or not the open-PO layer is present.
+    """
+    conn = get_connection()
+    try:
+        combined = (
+            pd.read_sql(f"SELECT * FROM {COMBINED_DISBURSEMENTS_SOURCE_TABLE}", conn)
+            if _table_exists(conn, COMBINED_DISBURSEMENTS_SOURCE_TABLE) else pd.DataFrame()
+        )
+    finally:
+        conn.close()
+    if not combined.empty:
+        return combined.groupby(
+            ["vendorNumber", "forecast_week", "week_start_date"], as_index=False
+        )["disbursements"].sum()
+    return load_table(AP_SOURCE_TABLE)
+
+
 def run(
     snapshot_date: Optional[dt.date] = None,
     as_of_date: Optional[dt.date] = None,
@@ -149,7 +174,7 @@ def run(
         as_of_date = dt.date.today()
 
     ar = _ar_receipts_source()
-    ap = load_table(AP_SOURCE_TABLE)
+    ap = _ap_disbursements_source()
     logger.info(
         "Loaded %d AR receipt rows, %d AP disbursement rows to snapshot",
         len(ar), len(ap),

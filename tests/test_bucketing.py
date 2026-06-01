@@ -375,3 +375,80 @@ def test_combined_view_empty_so_is_just_ar():
 
     assert len(combined) == 1
     assert combined.iloc[0]["source"] == SOURCE_AR
+
+
+# ---- open-PO payments bucketing + combined disbursements (Phase 5) ------------
+
+
+def _po_stamped(*rows):
+    """Build a stamped PO frame from (vendor, source_stream, payment_date, amount)."""
+    return pd.DataFrame({
+        "vendorNumber": [r[0] for r in rows],
+        "source_stream": [r[1] for r in rows],
+        "expected_payment_date": [r[2] for r in rows],
+        "amount": [r[3] for r in rows],
+    })
+
+
+def test_po_payments_bucket_into_correct_week_and_keep_source_stream():
+    from src.calc.bucketing import bucket_po_payments
+    po = _po_stamped(
+        ("V1", "po_rbni",        dt.date(2026, 5, 29), 1000.0),  # week 1
+        ("V1", "po_outstanding", dt.date(2026, 6, 1),  2000.0),  # week 2
+        ("V1", "po_rbni",        dt.date(2026, 6, 1),  500.0),   # week 2
+    )
+    agg = bucket_po_payments(po, AS_OF_FRIDAY, horizon_weeks=13)
+
+    assert "disbursements" in agg.columns
+    # week 2 keeps po_rbni and po_outstanding as SEPARATE rows
+    wk2 = agg[agg["forecast_week"] == 2].set_index("source_stream")["disbursements"].to_dict()
+    assert wk2["po_outstanding"] == pytest.approx(2000.0)
+    assert wk2["po_rbni"] == pytest.approx(500.0)
+
+
+def _ap_by_week(*rows):
+    return pd.DataFrame({
+        "vendorNumber": [r[0] for r in rows],
+        "forecast_week": [r[1] for r in rows],
+        "week_start_date": [r[2] for r in rows],
+        "disbursements": [r[3] for r in rows],
+    })
+
+
+def _po_by_week(*rows):
+    return pd.DataFrame({
+        "vendorNumber": [r[0] for r in rows],
+        "source_stream": [r[1] for r in rows],
+        "forecast_week": [r[2] for r in rows],
+        "week_start_date": [r[3] for r in rows],
+        "disbursements": [r[4] for r in rows],
+    })
+
+
+def test_combined_disbursements_is_true_union_no_mutation():
+    from src.calc.bucketing import build_combined_disbursements, SOURCE_AP
+    ap = _ap_by_week(("V1", 1, dt.date(2026, 5, 25), 100.0),
+                     ("V2", 2, dt.date(2026, 6, 1), 200.0))
+    po = _po_by_week(("V1", "po_rbni", 1, dt.date(2026, 5, 25), 300.0))
+    ap_before = ap.copy()
+
+    combined = build_combined_disbursements(ap, po)
+
+    assert len(combined) == len(ap) + len(po)  # 3
+    assert set(combined["source"]) == {SOURCE_AP, "po_rbni"}
+    # AP frame not mutated (no 'source' column leaked back in).
+    assert "source" not in ap.columns
+    pd.testing.assert_frame_equal(ap, ap_before)
+
+
+def test_combined_disbursements_graceful_when_po_empty():
+    """PO missing -> combined equals AP rows (tagged open_ap), no double-count."""
+    from src.calc.bucketing import build_combined_disbursements, SOURCE_AP
+    ap = _ap_by_week(("V1", 1, dt.date(2026, 5, 25), 100.0))
+    empty_po = pd.DataFrame(columns=["vendorNumber", "source_stream", "forecast_week", "week_start_date", "disbursements"])
+
+    combined = build_combined_disbursements(ap, empty_po)
+
+    assert len(combined) == 1
+    assert combined.iloc[0]["source"] == SOURCE_AP
+    assert combined.iloc[0]["disbursements"] == pytest.approx(100.0)

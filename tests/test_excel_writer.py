@@ -324,10 +324,14 @@ def test_ap_sheet_has_week_columns_and_total(tmp_path):
     wb = _build(tmp_path)
     ws = wb[SHEET_AP]
 
-    # Header: Vendor Number, Vendor Name, Week 1..13, Total = 16 columns
-    assert ws.max_column == 16
+    # Header: Vendor Number, Vendor Name, Week 1..13, Total, Source = 17 columns
+    # (Source added in Phase 5, mirroring the AR-by-Customer sheet).
+    assert ws.max_column == 17
     assert ws.cell(row=1, column=1).value == "Vendor Number"
     assert ws.cell(row=1, column=16).value == "Total"
+    assert ws.cell(row=1, column=17).value == "Source"
+    # AP-only fallback tags every row open_ap.
+    assert ws.cell(row=2, column=17).value == "open_ap"
     # VEND-A row: week source cells sum to 12,000 (3,000 wk1 + 9,000 wk2).
     assert ws.cell(row=2, column=1).value == "VEND-A"
     assert _row_week_value_sum(ws, 2) == pytest.approx(12_000.0)
@@ -609,3 +613,79 @@ def test_workbook_renders_ar_only_when_combined_none(tmp_path):
     write_workbook(wb, path)
     ws = load_workbook(path)[SHEET_AR]
     assert ws.max_row == _receipts()["customerNumber"].nunique() + 1
+
+
+# ---------------------------------------------------------------------------
+# Open-PO integration (Phase 5): combined AP+PO on the AP-by-Vendor sheet
+# ---------------------------------------------------------------------------
+
+
+def _combined_disbursements():
+    """combined_disbursements_by_week: VEND-A in open_ap AND po_rbni; PO fills late weeks."""
+    return pd.DataFrame({
+        "vendorNumber": ["VEND-A", "VEND-A", "VEND-B", "VEND-C"],
+        "forecast_week":  [1, 8, 9, 11],
+        "week_start_date": ["2026-05-25", "2026-07-13", "2026-07-20", "2026-08-03"],
+        "disbursements": [3_000.0, 4_000.0, 2_000.0, 1_500.0],
+        "source": ["open_ap", "po_rbni", "po_outstanding", "po_rbni"],
+    })
+
+
+def _po_diag():
+    return {
+        "rbni_total": 5_500.0, "outstanding_total": 2_000.0, "phase5_total": 7_500.0,
+        "rbni_by_type": {"Item": 4_000.0, "Charge (Item)": 1_500.0},
+        "outstanding_by_type": {"Item": 2_000.0},
+        "item_rbni_subtotal": 4_000.0, "invoice_lag_days": 7,
+    }
+
+
+def _build_with_po(tmp_path, combined_disb, po_diag=None):
+    wb = build_workbook(
+        _receipts(), _disbursements(), _customers(), _vendors(),
+        AS_OF, refresh_ts=None,
+        combined_disbursements=combined_disb, po_diagnostics=po_diag,
+    )
+    path = tmp_path / "po.xlsx"
+    write_workbook(wb, path)
+    return load_workbook(path)
+
+
+def test_ap_sheet_combined_vendor_in_two_sources_has_two_rows(tmp_path):
+    wb = _build_with_po(tmp_path, _combined_disbursements())
+    ws = wb[SHEET_AP]
+    rows = [(ws.cell(r, 1).value, ws.cell(r, 17).value) for r in range(2, ws.max_row + 1)]
+    vend_a = [r for r in rows if r[0] == "VEND-A"]
+    assert len(vend_a) == 2
+    assert {src for _, src in vend_a} == {"open_ap", "po_rbni"}
+
+
+def test_forecast_ap_total_reflects_combined_po_sources(tmp_path):
+    """Forecast AP disbursements SUM over the AP sheet now includes PO past wk 6."""
+    wb = _build_with_po(tmp_path, _combined_disbursements())
+    ap = wb[SHEET_AP]
+    # Week 8 (col J = 3+7) across all AP rows = the po_rbni 4,000.
+    wk8 = sum(ap.cell(r, 10).value or 0.0 for r in range(2, ap.max_row + 1))
+    assert wk8 == pytest.approx(4_000.0)
+    grand = sum(_row_week_value_sum(ap, r) for r in range(2, ap.max_row + 1))
+    assert grand == pytest.approx(_combined_disbursements()["disbursements"].sum())  # 10,500
+
+
+def test_ap_renders_ap_only_when_combined_disbursements_empty(tmp_path):
+    empty = pd.DataFrame(columns=["vendorNumber", "forecast_week", "week_start_date", "disbursements", "source"])
+    wb = _build_with_po(tmp_path, empty)
+    ws = wb[SHEET_AP]
+    # Falls back to _disbursements(): 2 vendors, all open_ap.
+    assert ws.max_row == _disbursements()["vendorNumber"].nunique() + 1
+    assert {ws.cell(r, 17).value for r in range(2, ws.max_row + 1)} == {"open_ap"}
+
+
+def test_assumptions_sheet_has_phase5_diagnostic_block(tmp_path):
+    wb = _build_with_po(tmp_path, _combined_disbursements(), po_diag=_po_diag())
+    ws = wb[SHEET_NOTES]
+    text = "\n".join(str(ws.cell(r, 1).value or "") for r in range(1, ws.max_row + 1))
+    assert "Phase 5 / PO Liabilities Diagnostic" in text
+    assert "GL 21300" in text
+    assert "$5,500" in text          # RBNI total
+    assert "$7,500" in text          # phase 5 total
+    assert "Item-only RBNI subtotal: $4,000" in text

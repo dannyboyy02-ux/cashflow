@@ -57,8 +57,16 @@ from src.calc.bucketing import (
     AR_OUTPUT_TABLE,
     AP_OUTPUT_TABLE,
     COMBINED_TABLE,
+    COMBINED_DISBURSEMENTS_TABLE,
     SOURCE_AR,
+    SOURCE_AP,
     monday_of_week,
+)
+from src.calc.po_payments_timing import (
+    INVOICE_LAG_DAYS,
+    OUTPUT_TABLE as PO_PAYMENTS_TABLE,
+    SOURCE_STREAM_RBNI,
+    SOURCE_STREAM_OUTSTANDING,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,7 +141,34 @@ def load_inputs() -> dict[str, pd.DataFrame]:
         "vendors": load_table("bc_vendors"),
         "variance": _load_optional("forecast_variance"),
         "combined": _load_optional(COMBINED_TABLE),
+        "combined_disbursements": _load_optional(COMBINED_DISBURSEMENTS_TABLE),
+        "po_payments": _load_optional(PO_PAYMENTS_TABLE),
     }
+
+
+def po_liabilities_diagnostics(po_payments: pd.DataFrame) -> dict:
+    """Summarize the Phase 5 open-PO disbursements for the Assumptions sheet.
+
+    Breaks RBNI and PO-outstanding totals down by Type, isolates the Item RBNI
+    subtotal (the figure that reconciles to GL 21300), and reports the invoice
+    lag. Returns zeros if po_payments is empty/None.
+    """
+    base = {
+        "rbni_total": 0.0, "outstanding_total": 0.0, "phase5_total": 0.0,
+        "rbni_by_type": {}, "outstanding_by_type": {}, "item_rbni_subtotal": 0.0,
+        "invoice_lag_days": INVOICE_LAG_DAYS,
+    }
+    if po_payments is None or po_payments.empty or "source_stream" not in po_payments.columns:
+        return base
+    rbni = po_payments[po_payments["source_stream"] == SOURCE_STREAM_RBNI]
+    out = po_payments[po_payments["source_stream"] == SOURCE_STREAM_OUTSTANDING]
+    base["rbni_total"] = round(float(rbni["amount"].sum()), 2)
+    base["outstanding_total"] = round(float(out["amount"].sum()), 2)
+    base["phase5_total"] = round(base["rbni_total"] + base["outstanding_total"], 2)
+    base["rbni_by_type"] = {k: round(float(v), 2) for k, v in rbni.groupby("Type")["amount"].sum().items()}
+    base["outstanding_by_type"] = {k: round(float(v), 2) for k, v in out.groupby("Type")["amount"].sum().items()}
+    base["item_rbni_subtotal"] = round(float(rbni[rbni["Type"] == "Item"]["amount"].sum()), 2)
+    return base
 
 
 def latest_refresh_timestamp(folder) -> Optional[dt.datetime]:
@@ -433,6 +468,78 @@ def _build_ar_by_customer_sheet(
 
 
 # ---------------------------------------------------------------------------
+# AP by Vendor -- open-AP + open-PO (RBNI / outstanding), one row per (vendor, source)
+# ---------------------------------------------------------------------------
+
+
+def _build_ap_by_vendor_sheet(
+    ws: Worksheet,
+    ap_long: pd.DataFrame,
+    master: pd.DataFrame,
+    horizon_weeks: int,
+) -> int:
+    """AP-by-vendor detail with a Source column (open_ap / po_rbni / po_outstanding).
+
+    Mirror of _build_ar_by_customer_sheet on the AP side. Accepts either
+    combined_disbursements_by_week (has a "source" column) or
+    ap_disbursements_by_week (no source -> treated as all open_ap). One row per
+    (vendor, source), sorted by row total descending. Week columns stay at C..O
+    and Total at P so the forecast sheet's cross-sheet SUM over C..O captures all
+    sources; Source is the trailing column (Q). Returns the data-row count.
+    """
+    headers = (
+        ["Vendor Number", "Vendor Name"]
+        + [f"Week {w}" for w in range(1, horizon_weeks + 1)]
+        + ["Total", "Source"]
+    )
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+
+    name_map: dict = {}
+    if not master.empty and "number" in master.columns and "displayName" in master.columns:
+        name_map = dict(zip(master["number"], master["displayName"]))
+
+    first_week_col = 3
+    last_week_col = 2 + horizon_weeks         # O for 13 weeks
+    total_col = last_week_col + 1             # P
+    source_col = total_col + 1                # Q
+    first_letter = get_column_letter(first_week_col)
+    last_letter = get_column_letter(last_week_col)
+
+    n_rows = 0
+    if ap_long is not None and not ap_long.empty and "forecast_week" in ap_long.columns:
+        df = ap_long.copy()
+        if "source" not in df.columns:
+            df["source"] = SOURCE_AP
+        built = []
+        for (vendor, source), g in df.groupby(["vendorNumber", "source"]):
+            wk_sum = g.groupby("forecast_week")["disbursements"].sum()
+            week_vals = [float(wk_sum.get(w, 0.0)) for w in range(1, horizon_weeks + 1)]
+            built.append((vendor, name_map.get(vendor, ""), source, week_vals, sum(week_vals)))
+        built.sort(key=lambda x: x[4], reverse=True)
+
+        for vendor, name, source, week_vals, _total in built:
+            r = ws.max_row + 1
+            ws.cell(row=r, column=1, value=vendor).font = F_BASE
+            ws.cell(row=r, column=2, value=name).font = F_BASE
+            for j, v in enumerate(week_vals):
+                _money(ws.cell(row=r, column=first_week_col + j, value=v))
+            _money(ws.cell(row=r, column=total_col,
+                           value=f"=SUM({first_letter}{r}:{last_letter}{r})"))
+            ws.cell(row=r, column=source_col, value=source).font = F_BASE
+            n_rows += 1
+
+    ws.freeze_panes = "C2"
+    widths = {"A": 16, "B": 32}
+    for w in range(1, horizon_weeks + 1):
+        widths[get_column_letter(2 + w)] = 12
+    widths[get_column_letter(total_col)] = 16
+    widths[get_column_letter(source_col)] = 10
+    _set_widths(ws, widths)
+    return n_rows
+
+
+# ---------------------------------------------------------------------------
 # Variance sheet -- today vs prior snapshot (week level)
 # ---------------------------------------------------------------------------
 
@@ -521,6 +628,7 @@ def _build_assumptions_sheet(
     ws: Worksheet,
     as_of_date: dt.date,
     refresh_ts: Optional[dt.datetime],
+    po_diagnostics: Optional[dict] = None,
 ) -> None:
     refresh_str = refresh_ts.isoformat(sep=" ", timespec="seconds") if refresh_ts else "unknown"
     lines: list[tuple[str, bool]] = [
@@ -568,13 +676,40 @@ def _build_assumptions_sheet(
         ("  - debt service", False),
         ("  - capital expenditures", False),
         ("  - tax payments", False),
-        ("  - new billings beyond current open AR", False),
-        ("  - received-but-not-invoiced (RBNI) accruals", False),
+        ("  - new billings beyond current open AR / new POs beyond current open PO", False),
         ("", False),
         ("Beginning Cash on the forecast sheet is a placeholder (0). Enter the", False),
         ("actual week-1 starting bank balance and the Ending/Beginning chain", False),
         ("recomputes the full 13-week cash position.", False),
     ]
+
+    # Phase 5 / PO Liabilities Diagnostic block. RBNI (received-but-not-invoiced)
+    # and PO outstanding are now INCLUDED in the AP forecast (Phase 5), so they
+    # are no longer in the caveat list above.
+    diag = po_diagnostics or po_liabilities_diagnostics(None)
+    lines += [
+        ("", False),
+        ("Phase 5 / PO Liabilities Diagnostic", True),
+        (f"  Invoice lag (goods received -> vendor invoice posted): {diag['invoice_lag_days']} days", False),
+        (f"  Total RBNI extracted (received, not yet invoiced): ${diag['rbni_total']:,.0f}", False),
+    ]
+    for t, v in sorted(diag["rbni_by_type"].items(), key=lambda kv: -kv[1]):
+        lines.append((f"      RBNI by Type -- {t}: ${v:,.0f}", False))
+    lines.append((f"  Total PO outstanding extracted (ordered, not yet received): ${diag['outstanding_total']:,.0f}", False))
+    for t, v in sorted(diag["outstanding_by_type"].items(), key=lambda kv: -kv[1]):
+        lines.append((f"      PO outstanding by Type -- {t}: ${v:,.0f}", False))
+    lines += [
+        (f"  Total Phase 5 future AP cash added (RBNI + outstanding): ${diag['phase5_total']:,.0f}", False),
+        (f"  Item-only RBNI subtotal: ${diag['item_rbni_subtotal']:,.0f}", False),
+        (
+            "  GL 21300 reconciliation: Item RBNI subtotal should approximately "
+            "match the GL 21300 (Invt. Accrual Acc. Interim) balance net of "
+            "pending purchase credit memos. Manual check; PO credit memo handling "
+            "is a queued v2 enhancement.",
+            False,
+        ),
+    ]
+
     for i, (text, is_header) in enumerate(lines, start=1):
         cell = ws.cell(row=i, column=1, value=text)
         if i == 1:
@@ -605,6 +740,8 @@ def build_workbook(
     refresh_ts: Optional[dt.datetime] = None,
     variance: Optional[pd.DataFrame] = None,
     combined: Optional[pd.DataFrame] = None,
+    combined_disbursements: Optional[pd.DataFrame] = None,
+    po_diagnostics: Optional[dict] = None,
     horizon_weeks: int = FORECAST_HORIZON_WEEKS,
 ) -> Workbook:
     """Build the five-sheet forecast workbook from the bucketed inputs.
@@ -614,9 +751,10 @@ def build_workbook(
     sheet can size its cross-sheet SUM ranges to the actual entity row counts.
 
     The AR-by-Customer sheet uses combined_receipts_by_week (open-AR + open-SO)
-    when available, so the headline forecast's AR receipts fill past the wk-6
-    cliff; if combined is missing/empty it falls back to AR-only (receipts),
-    rendering the old cliff with no error.
+    and the AP-by-Vendor sheet uses combined_disbursements_by_week (open-AP +
+    open-PO RBNI/outstanding) when available, so the headline forecast fills past
+    the wk-6 cliff on both sides; each falls back to the AR-only / AP-only table
+    if its combined view is missing/empty, with no error.
     """
     wb = Workbook()
     ws_fc = wb.active
@@ -627,14 +765,16 @@ def build_workbook(
     ws_notes = wb.create_sheet(SHEET_NOTES)
 
     ar_long = combined if (combined is not None and not combined.empty) else receipts
-    n_cust = _build_ar_by_customer_sheet(ws_ar, ar_long, customers, horizon_weeks)
-    n_vend = _build_entity_sheet(
-        ws_ap, disbursements, vendors, "vendorNumber", "disbursements",
-        "Vendor Number", "Vendor Name", horizon_weeks,
+    ap_long = (
+        combined_disbursements
+        if (combined_disbursements is not None and not combined_disbursements.empty)
+        else disbursements
     )
+    n_cust = _build_ar_by_customer_sheet(ws_ar, ar_long, customers, horizon_weeks)
+    n_vend = _build_ap_by_vendor_sheet(ws_ap, ap_long, vendors, horizon_weeks)
     _build_forecast_sheet(ws_fc, as_of_date, horizon_weeks, n_cust, n_vend)
     _build_variance_sheet(ws_var, variance, horizon_weeks)
-    _build_assumptions_sheet(ws_notes, as_of_date, refresh_ts)
+    _build_assumptions_sheet(ws_notes, as_of_date, refresh_ts, po_diagnostics)
 
     return wb
 
@@ -667,11 +807,14 @@ def run(
         refresh_ts.isoformat(sep=" ", timespec="seconds") if refresh_ts else "unknown",
     )
 
+    po_diagnostics = po_liabilities_diagnostics(data["po_payments"])
     wb = build_workbook(
         data["receipts"], data["disbursements"],
         data["customers"], data["vendors"],
         as_of_date, refresh_ts,
         variance=data["variance"], combined=data["combined"],
+        combined_disbursements=data["combined_disbursements"],
+        po_diagnostics=po_diagnostics,
     )
     saved = write_workbook(wb, output_path)
     logger.info("Wrote workbook to %s", saved)
