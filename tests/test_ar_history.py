@@ -63,8 +63,8 @@ def test_read_csv_preserves_signed_amounts(tmp_path: Path) -> None:
     df = read_csv(csv_path)
 
     sales = df[df["documentType"].isin(["Invoice", "Credit Memo"])]
-    customer_4002 = sales[sales["customerNumber"] == "CUST-A"]["amount"].sum()
-    assert customer_4002 == pytest.approx(10816.68)
+    customer_a_sales = sales[sales["customerNumber"] == "CUST-A"]["amount"].sum()
+    assert customer_a_sales == pytest.approx(10816.68)
 
 
 def test_read_csv_parses_mixed_open_and_closed(tmp_path: Path) -> None:

@@ -18,6 +18,10 @@ with open(PROJECT_ROOT / "config.yaml") as _f:
     _yaml_config = yaml.safe_load(_f)
 
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+# Organization name for deliverable titles. Read from .env (gitignored) so the
+# real company name never lives in this public repo; the default is a generic
+# placeholder. Set ORG_NAME in .env for the real workbook title.
+ORG_NAME: str = os.getenv("ORG_NAME", "Sample Foods Co.")
 ONEDRIVE_DATA_PATH: Path = Path(os.getenv("ONEDRIVE_DATA_PATH", ""))
 SQLITE_PATH: Path = PROJECT_ROOT / os.getenv("SQLITE_PATH", "data/cashflow.db")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

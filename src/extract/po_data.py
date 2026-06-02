@@ -21,8 +21,8 @@ SCHEMA NOTES (follow the file):
     uses the renamed columns (rbniAmount, outstandingAmount, expectedReceiptDate).
   - Type carries multiple values (Item, Charge (Item), G/L Account, Resource,
     possibly Fixed Asset). We do NOT assert any particular set.
-  - PurchaseOrders.vendorNumber arrives numeric (e.g. 1001.0) from the OData
-    feed; bc_vendor_dpo / bc_vendors key on text vendor numbers ("1001"), so it
+  - PurchaseOrders.vendorNumber arrives numeric (e.g. 1234.0) from the OData
+    feed; bc_vendor_dpo / bc_vendors key on text vendor numbers ("1234"), so it
     is coerced to a clean integer-string here for the downstream DPO join.
 
 GRACEFUL DEGRADATION (the pipeline must never break on PO data):
@@ -85,7 +85,7 @@ def _validate_columns(df: pd.DataFrame, expected: list[str], sheet: str) -> None
 
 
 def _clean_vendor_number(s: pd.Series) -> pd.Series:
-    """Coerce a numeric-looking vendor number (1001.0) to a clean string ('1001').
+    """Coerce a numeric-looking vendor number (1234.0) to a clean string ('1234').
 
     Non-numeric vendor codes (none in current data, but possible) pass through as
     their stripped string form.

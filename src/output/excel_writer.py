@@ -59,6 +59,7 @@ from src.config import (
     DATA_DIR,
     ONEDRIVE_DATA_PATH,
     FORECAST_HORIZON_WEEKS,
+    ORG_NAME,
 )
 from src.db import get_connection
 from src.calc.bucketing import (
@@ -956,7 +957,7 @@ def _build_assumptions_sheet(
 ) -> None:
     refresh_str = refresh_ts.isoformat(sep=" ", timespec="seconds") if refresh_ts else "unknown"
     lines: list[tuple[str, bool]] = [
-        ("Sample Foods Co. -- 13-Week Cash Flow Forecast", True),
+        (f"{ORG_NAME} -- 13-Week Cash Flow Forecast", True),
         ("", False),
         (f"As-of date: {as_of_date.isoformat()}", False),
         (f"Source data refreshed: {refresh_str}", False),
