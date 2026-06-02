@@ -31,12 +31,14 @@ source_stream so each week keeps the two streams separate.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
-from src.config import LOG_LEVEL, LOG_FORMAT
+from src.config import LOG_LEVEL, LOG_FORMAT, INPUTS_DIR
 from src.db import get_connection
 from src.calc.dpo import METHOD_RATIO
 from src.transform.ap_due_dates import DEFAULT_DUE_DAYS
@@ -45,6 +47,11 @@ logger = logging.getLogger(__name__)
 
 INPUT_TABLE = "po_open_lines"
 OUTPUT_TABLE = "po_open_with_expected_payment"
+
+# Optional model-assumption config (gitignored). Holds the FP&A conversion
+# haircut on Tier-3 PO outstanding (ordered, not yet received). Default 0.0 =
+# the conservative gross view (no change to prior behavior).
+PO_CONFIG_FILE = INPUTS_DIR / "po_config.json"
 
 INVOICE_LAG_DAYS = 7    # days from goods-received to vendor-invoice-posted
 
@@ -62,6 +69,20 @@ OUTPUT_COLUMNS = _BASE_COLUMNS + [
     "amount", "source_stream", "expected_payment_date",
     "payment_method", "was_overdue", "days_overdue",
 ]
+
+
+def load_outstanding_haircut(path: Optional[Path] = None) -> float:
+    """Read the Tier-3 PO-outstanding conversion haircut (fraction), default 0.0.
+
+    A haircut of 0.30 means only 70% of each open PO line's outstanding amount
+    is timed as a future disbursement, reflecting that ordered-not-received POs
+    can still be changed/cancelled before receipt (FP&A lower-certainty tier).
+    """
+    path = Path(path) if path is not None else PO_CONFIG_FILE
+    if not path.exists():
+        return 0.0
+    with open(path) as f:
+        return float(json.load(f).get("outstanding_haircut_pct", 0.0))
 
 
 def _resolve_lag(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
@@ -86,11 +107,14 @@ def build_po_payments(
     po_lines: pd.DataFrame,
     dpo_df: pd.DataFrame,
     as_of: dt.date,
+    outstanding_haircut: float = 0.0,
 ) -> pd.DataFrame:
     """Emit up to two disbursement rows per open PO line (RBNI + outstanding).
 
     Joins bc_vendor_dpo for the payment-lag waterfall, then builds the two
-    sub-streams and concatenates. Returns the OUTPUT_COLUMNS shape.
+    sub-streams and concatenates. The Tier-3 outstanding stream is scaled by
+    (1 - outstanding_haircut) -- RBNI (Tier 2, goods in hand) is never haircut.
+    Returns the OUTPUT_COLUMNS shape.
     """
     df = po_lines.merge(
         dpo_df[["vendorNumber", "dpo_days", "dpo_method", "terms_days"]],
@@ -115,7 +139,9 @@ def build_po_payments(
     # Outstanding sub-stream: received on expectedReceiptDate, then invoiced+paid.
     out_src = df[df["outstandingAmount"] > 0].copy()
     out = out_src[_BASE_COLUMNS].copy()
-    out["amount"] = out_src["outstandingAmount"].astype(float)
+    # Tier-3 conversion haircut: only (1 - haircut) of the ordered-not-received
+    # amount is timed as future cash.
+    out["amount"] = (out_src["outstandingAmount"].astype(float) * (1.0 - outstanding_haircut)).round(2)
     out["source_stream"] = SOURCE_STREAM_OUTSTANDING
     # A missing expectedReceiptDate (blank in BC) is treated as received as-of
     # (imminent): keeps the line in the forecast rather than dropping it, and
@@ -172,8 +198,9 @@ def run(as_of: Optional[dt.date] = None) -> None:
         len(po_lines), len(dpo_df), as_of.isoformat(),
     )
 
-    result = build_po_payments(po_lines, dpo_df, as_of)
-    logger.info("PO payments timing summary: %s", _summary(result, as_of))
+    haircut = load_outstanding_haircut()
+    result = build_po_payments(po_lines, dpo_df, as_of, outstanding_haircut=haircut)
+    logger.info("PO payments timing summary (Tier-3 haircut=%.2f): %s", haircut, _summary(result, as_of))
 
     n = write_to_sqlite(result)
     logger.info("Wrote %d rows to SQLite table %s", n, OUTPUT_TABLE)

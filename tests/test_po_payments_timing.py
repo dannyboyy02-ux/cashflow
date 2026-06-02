@@ -182,3 +182,34 @@ def test_empty_input_returns_empty_with_columns():
     out = build_po_payments(empty, _dpo_df(), AS_OF)
     assert len(out) == 0
     assert "source_stream" in out.columns
+
+
+# ---- Tier-3 outstanding haircut (FP&A conversion certainty) ------------------
+
+
+def test_outstanding_haircut_scales_only_outstanding():
+    """A 30% haircut times the PO-outstanding amount by 0.70; RBNI is untouched."""
+    line = _po_line("VEND-RATIO", rbni_amount=1000.0, outstanding_amount=2000.0)
+    out = build_po_payments(_lines(line), _dpo_df(), AS_OF, outstanding_haircut=0.30)
+    by = out.set_index("source_stream")["amount"].to_dict()
+    assert by[SOURCE_STREAM_RBNI] == pytest.approx(1000.0)        # RBNI unchanged
+    assert by[SOURCE_STREAM_OUTSTANDING] == pytest.approx(1400.0)  # 2000 * 0.70
+
+
+def test_outstanding_haircut_zero_is_gross_view():
+    line = _po_line("VEND-RATIO", outstanding_amount=2000.0)
+    out = build_po_payments(_lines(line), _dpo_df(), AS_OF, outstanding_haircut=0.0)
+    assert out.iloc[0]["amount"] == pytest.approx(2000.0)
+
+
+def test_load_outstanding_haircut_missing_file_defaults_zero(tmp_path):
+    from src.calc.po_payments_timing import load_outstanding_haircut
+    assert load_outstanding_haircut(tmp_path / "nope.json") == 0.0
+
+
+def test_load_outstanding_haircut_reads_value(tmp_path):
+    import json
+    from src.calc.po_payments_timing import load_outstanding_haircut
+    p = tmp_path / "po_config.json"
+    p.write_text(json.dumps({"outstanding_haircut_pct": 0.25}))
+    assert load_outstanding_haircut(p) == pytest.approx(0.25)
