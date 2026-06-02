@@ -502,7 +502,7 @@ if __name__ == "__main__":
     # combined_receipts needs AR+SO; combined_disbursements needs AP+PO; snapshot
     # needs both combined views. The SO/PO steps no-op cleanly when their inputs
     # are missing; variance no-ops on the first run (one snapshot date).
-    from src.calc import snapshot, variance, payroll, debt_service, revolver
+    from src.calc import snapshot, variance, payroll, debt_service, revolver, actuals_variance
     run_receipts()
     run_so_receipts()
     run_combined_view()
@@ -520,3 +520,6 @@ if __name__ == "__main__":
     revolver.run()
     snapshot.run()
     variance.run()
+    # Grade closed weeks (recorded actuals vs the forecast standing entering each
+    # week). No-ops until inputs/actuals.json has weeks with a matching snapshot.
+    actuals_variance.run()
