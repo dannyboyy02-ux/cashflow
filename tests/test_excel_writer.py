@@ -29,6 +29,8 @@ from src.output.excel_writer import (
     SHEET_FORECAST,
     SHEET_NOTES,
     SHEET_PAYROLL,
+    SHEET_AVF,
+    SHEET_ACTUALS,
     SHEET_REVOLVER,
     SHEET_VARIANCE,
     VARIANCE_PLACEHOLDER,
@@ -134,7 +136,8 @@ def test_all_sheets_exist_in_expected_order(tmp_path):
     wb = _build(tmp_path)
     assert wb.sheetnames == [
         SHEET_FORECAST, SHEET_AR, SHEET_AP, SHEET_PAYROLL,
-        SHEET_DEBT, SHEET_REVOLVER, SHEET_VARIANCE, SHEET_NOTES,
+        SHEET_DEBT, SHEET_REVOLVER, SHEET_VARIANCE, SHEET_AVF,
+        SHEET_ACTUALS, SHEET_NOTES,
     ]
 
 
@@ -548,7 +551,8 @@ def test_empty_inputs_still_produce_all_sheets(tmp_path):
 
     assert loaded.sheetnames == [
         SHEET_FORECAST, SHEET_AR, SHEET_AP, SHEET_PAYROLL,
-        SHEET_DEBT, SHEET_REVOLVER, SHEET_VARIANCE, SHEET_NOTES,
+        SHEET_DEBT, SHEET_REVOLVER, SHEET_VARIANCE, SHEET_AVF,
+        SHEET_ACTUALS, SHEET_NOTES,
     ]
     ws = loaded[SHEET_FORECAST]
     assert ws.max_row == 15  # header + 13 + totals
@@ -986,3 +990,67 @@ def test_assumptions_has_po_certainty_tier_notation(tmp_path):
     assert "Disbursement certainty tiers" in text
     assert "Tier 3" in text and "ordered, not yet received" in text
     assert "haircut" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Phase 7f: Actual vs Forecast + Actuals input tab
+# ---------------------------------------------------------------------------
+
+
+def _fva_df():
+    return pd.DataFrame({
+        "week_start_date": ["2026-05-18", "2026-05-25"],
+        "forecast_snapshot_date": ["2026-05-18", "2026-05-25"],
+        "forecast_receipts": [1_000_000.0, 1_200_000.0],
+        "actual_receipts": [1_100_000.0, 1_150_000.0],
+        "receipts_variance": [100_000.0, -50_000.0],
+        "forecast_disbursements": [600_000.0, 700_000.0],
+        "actual_disbursements": [620_000.0, 700_000.0],
+        "disbursements_variance": [20_000.0, 0.0],
+        "forecast_net": [400_000.0, 500_000.0],
+        "actual_net": [480_000.0, 450_000.0],
+        "net_variance": [80_000.0, -50_000.0],
+    })
+
+
+def test_avf_placeholder_when_no_grading(tmp_path):
+    wb = _build(tmp_path)  # no forecast_vs_actual passed
+    ws = wb[SHEET_AVF]
+    assert "No closed weeks graded yet" in str(ws.cell(1, 1).value)
+
+
+def test_avf_populated_rows_and_variance_values(tmp_path):
+    wb = build_workbook(_receipts(), _disbursements(), _customers(), _vendors(), AS_OF,
+                        forecast_vs_actual=_fva_df())
+    path = tmp_path / "avf.xlsx"; write_workbook(wb, path)
+    ws = load_workbook(path)[SHEET_AVF]
+    assert ws.cell(1, 1).value == "Week Start"
+    # 2 graded weeks + header + totals row = 4
+    assert ws.max_row == 4
+    # wk1 receipts variance (+100k) and net variance (+80k)
+    assert ws.cell(2, 4).value == pytest.approx(100_000.0)
+    assert ws.cell(2, 10).value == pytest.approx(80_000.0)
+    assert ws.cell(4, 1).value == "TOTAL"
+    assert ws.cell(4, 10).value == "=SUM(J2:J3)"
+
+
+def test_actuals_tab_is_input_grid_seeded_from_json(tmp_path):
+    actuals = {"2026-05-25": {"receipts": 1_111.0, "disbursements": 222.0, "ending_cash": 3_333.0}}
+    wb = build_workbook(_receipts(), _disbursements(), _customers(), _vendors(), AS_OF,
+                        actuals=actuals)
+    path = tmp_path / "act.xlsx"; write_workbook(wb, path)
+    ws = load_workbook(path)[SHEET_ACTUALS]
+    assert [ws.cell(1, c).value for c in range(1, 5)] == [
+        "Week Start", "Actual Receipts", "Actual Disbursements", "Actual Ending Cash"]
+    # The recorded week's row is seeded; its amount cells are yellow inputs.
+    found = None
+    for r in range(2, ws.max_row + 1):
+        v = ws.cell(r, 1).value
+        if v is not None and str(v).startswith("2026-05-25"):
+            found = r
+            break
+    assert found is not None
+    assert ws.cell(found, 2).value == pytest.approx(1_111.0)
+    assert (ws.cell(found, 2).fill.fgColor.rgb or "").endswith("FFFF00")  # yellow input
+    # AS_OF Friday -> the 8 prior Mondays are pre-listed for entry (blank).
+    assert ws.max_row >= 9  # header + >= 8 lookback weeks

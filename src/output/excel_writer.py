@@ -78,6 +78,7 @@ from src.calc.po_payments_timing import (
     SOURCE_STREAM_OUTSTANDING,
 )
 from src.calc.revolver import load_revolver_config
+from src.calc.actuals_variance import load_actuals
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,17 @@ SHEET_AP = "AP by Vendor"
 SHEET_PAYROLL = "Payroll"
 SHEET_DEBT = "Debt Service"
 SHEET_REVOLVER = "Revolver"
+SHEET_AVF = "Actual vs Forecast"
+SHEET_ACTUALS = "Actuals"
 SHEET_NOTES = "Assumptions & Notes"
+
+ACTUALS_PLACEHOLDER = (
+    "No closed weeks graded yet. Record weekly actuals on the Actuals tab, run "
+    "`python -m src.ingest_actuals`, then refresh -- accuracy appears here."
+)
+
+# How many recently-closed weeks the Actuals input tab pre-lists for entry.
+ACTUALS_LOOKBACK_WEEKS = 8
 
 # Revolver-input seed values used to build the Assumptions "Revolver Inputs"
 # block + named ranges when no live config is supplied (mirrors the keys in
@@ -180,6 +191,7 @@ def load_inputs() -> dict[str, pd.DataFrame]:
         "payroll": _load_optional("payroll_by_week"),
         "debt_principal": _load_optional("debt_principal_by_week"),
         "debt_interest": _load_optional("debt_interest_by_week"),
+        "forecast_vs_actual": _load_optional("forecast_vs_actual"),
     }
 
 
@@ -944,6 +956,129 @@ def _build_variance_sheet(
 
 
 # ---------------------------------------------------------------------------
+# Actual vs Forecast -- weekly forecast-accuracy scorecard (display)
+# ---------------------------------------------------------------------------
+
+
+def _build_actual_vs_forecast_sheet(
+    ws: Worksheet,
+    fva: Optional[pd.DataFrame],
+) -> None:
+    """Render forecast_vs_actual: one row per graded (closed) week.
+
+    receipts/net variances use the favorable delta format (actual > forecast is
+    good for cash, green); the disbursements variance uses the unfavorable format
+    (actual > forecast means we paid more than expected, red). Placeholder when
+    nothing has been graded yet.
+    """
+    if fva is None or fva.empty:
+        cell = ws.cell(row=1, column=1, value=ACTUALS_PLACEHOLDER)
+        cell.font = F_BASE
+        ws.column_dimensions["A"].width = 90
+        return
+
+    headers = [
+        "Week Start", "Forecast Receipts", "Actual Receipts", "Receipts Var",
+        "Forecast Disb", "Actual Disb", "Disb Var",
+        "Forecast Net", "Actual Net", "Net Var",
+    ]
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+
+    src_cols = [
+        "forecast_receipts", "actual_receipts", "receipts_variance",
+        "forecast_disbursements", "actual_disbursements", "disbursements_variance",
+        "forecast_net", "actual_net", "net_variance",
+    ]
+    fva = fva.sort_values("week_start_date")
+    for _, row in fva.iterrows():
+        r = ws.max_row + 1
+        dcell = ws.cell(row=r, column=1, value=_coerce_date(row["week_start_date"]))
+        dcell.number_format = DATE_FMT
+        dcell.font = F_BASE
+        for j, col in enumerate(src_cols):
+            c = ws.cell(row=r, column=2 + j, value=float(row[col]))
+            if col == "receipts_variance" or col == "net_variance":
+                _delta(c)                                   # favorable: green +
+            elif col == "disbursements_variance":
+                _delta(c, fmt=DELTA_FMT_UNFAVORABLE)        # unfavorable: red +
+            else:
+                _money(c)
+
+    # Totals row.
+    tr = ws.max_row + 1
+    last = tr - 1
+    ws.cell(row=tr, column=1, value="TOTAL").font = F_HEADER
+    for col in range(2, 11):
+        letter = get_column_letter(col)
+        cell = ws.cell(row=tr, column=col, value=f"=SUM({letter}2:{letter}{last})")
+        if col in (4, 10):       # receipts var, net var
+            _delta(cell, F_HEADER)
+        elif col == 7:           # disb var
+            _delta(cell, F_HEADER, fmt=DELTA_FMT_UNFAVORABLE)
+        else:
+            _money(cell, F_HEADER)
+
+    ws.freeze_panes = "B2"
+    widths = {"A": 12}
+    for c in range(2, 11):
+        widths[get_column_letter(c)] = 15
+    _set_widths(ws, widths)
+
+
+# ---------------------------------------------------------------------------
+# Actuals -- weekly bank actuals INPUT tab (round-trip via ingest_actuals)
+# ---------------------------------------------------------------------------
+
+
+def _build_actuals_sheet(
+    ws: Worksheet,
+    actuals: Optional[dict],
+    as_of_date: dt.date,
+    horizon_weeks: int,
+) -> None:
+    """Input tab where the CFO types actuals for closed weeks (yellow cells).
+
+    Pre-lists the recently-closed weeks (ACTUALS_LOOKBACK_WEEKS before week 1)
+    plus any weeks already recorded in inputs/actuals.json, seeding entered
+    values. After typing, run `python -m src.ingest_actuals` to write these back
+    to actuals.json before the next refresh (the JSON is the source of truth; this
+    tab is re-seeded from it on each generation).
+
+    Fixed layout for the ingest reader: row 1 header; rows 2+ are
+    A=Week Start, B=Actual Receipts, C=Actual Disbursements, D=Actual Ending Cash.
+    """
+    actuals = actuals or {}
+    headers = ["Week Start", "Actual Receipts", "Actual Disbursements", "Actual Ending Cash"]
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+    note = ws.cell(row=1, column=6,
+                   value="Enter actuals for CLOSED weeks (receipts + disbursements "
+                         "both required), then run: python -m src.ingest_actuals  "
+                         "before the next refresh.")
+    note.font = F_BASE
+
+    week_1_monday = monday_of_week(as_of_date)
+    recent = {(week_1_monday - dt.timedelta(days=7 * k)).isoformat()
+              for k in range(1, ACTUALS_LOOKBACK_WEEKS + 1)}
+    weeks = sorted(recent | set(actuals.keys()))
+
+    for i, wk in enumerate(weeks):
+        r = i + 2
+        rec = actuals.get(wk, {})
+        dcell = ws.cell(row=r, column=1, value=_coerce_date(wk))
+        dcell.number_format = DATE_FMT
+        dcell.font = F_BASE
+        for col, key in ((2, "receipts"), (3, "disbursements"), (4, "ending_cash")):
+            cell = ws.cell(row=r, column=col, value=rec.get(key))   # None if unrecorded
+            cell.fill = _INPUT_FILL
+            _money(cell, F_INPUT)
+
+    ws.freeze_panes = "B2"
+    _set_widths(ws, {"A": 12, "B": 18, "C": 20, "D": 18})
+
+
+# ---------------------------------------------------------------------------
 # Sheet 4 -- Assumptions & Notes
 # ---------------------------------------------------------------------------
 
@@ -1143,19 +1278,21 @@ def build_workbook(
     debt_principal: Optional[pd.DataFrame] = None,
     debt_interest: Optional[pd.DataFrame] = None,
     revolver_config: Optional[dict] = None,
+    forecast_vs_actual: Optional[pd.DataFrame] = None,
+    actuals: Optional[dict] = None,
     horizon_weeks: int = FORECAST_HORIZON_WEEKS,
 ) -> Workbook:
-    """Build the eight-sheet forecast workbook (Phase 7e layout).
+    """Build the ten-sheet forecast workbook (Phase 7f layout).
 
     Sheet order: 13-Week Forecast, AR by Customer, AP by Vendor, Payroll,
-    Debt Service, Revolver, Variance, Assumptions & Notes.
+    Debt Service, Revolver, Variance, Actual vs Forecast, Actuals,
+    Assumptions & Notes.
 
-    Every sheet is formula-driven. The revolver plug is now visible Excel math
-    on its own tab (referencing the Assumptions Revolver Inputs named ranges and
-    the Forecast Inflows/Outflows); the Forecast sheet's Beginning/Ending cash
-    and revolver columns reference the Revolver tab -- no static revolver values
-    anywhere. The Assumptions sheet is built last so its named ranges resolve
-    against the final layout.
+    The revolver plug is visible Excel math (formulas referencing the Assumptions
+    named-range inputs); the Forecast references it. 'Actual vs Forecast' renders
+    the forecast-accuracy grading; 'Actuals' is the CFO's weekly input tab
+    (round-tripped to inputs/actuals.json by src.ingest_actuals). The Assumptions
+    sheet is built last so its named ranges resolve against the final layout.
     """
     wb = Workbook()
     ws_fc = wb.active
@@ -1166,6 +1303,8 @@ def build_workbook(
     ws_debt = wb.create_sheet(SHEET_DEBT)
     ws_rev = wb.create_sheet(SHEET_REVOLVER)
     ws_var = wb.create_sheet(SHEET_VARIANCE)
+    ws_avf = wb.create_sheet(SHEET_AVF)
+    ws_act = wb.create_sheet(SHEET_ACTUALS)
     ws_notes = wb.create_sheet(SHEET_NOTES)
 
     ar_long = combined if (combined is not None and not combined.empty) else receipts
@@ -1183,6 +1322,8 @@ def build_workbook(
     )
     _build_revolver_sheet(ws_rev, as_of_date, horizon_weeks)
     _build_variance_sheet(ws_var, variance, horizon_weeks)
+    _build_actual_vs_forecast_sheet(ws_avf, forecast_vs_actual)
+    _build_actuals_sheet(ws_act, actuals, as_of_date, horizon_weeks)
     _build_assumptions_sheet(ws_notes, as_of_date, refresh_ts, po_diagnostics, revolver_config)
 
     return wb
@@ -1218,6 +1359,7 @@ def run(
 
     po_diagnostics = po_liabilities_diagnostics(data["po_payments"])
     revolver_config = load_revolver_config()
+    actuals = load_actuals()
     wb = build_workbook(
         data["receipts"], data["disbursements"],
         data["customers"], data["vendors"],
@@ -1229,6 +1371,8 @@ def run(
         debt_principal=data["debt_principal"],
         debt_interest=data["debt_interest"],
         revolver_config=revolver_config,
+        forecast_vs_actual=data["forecast_vs_actual"],
+        actuals=actuals,
     )
     saved = write_workbook(wb, output_path)
     logger.info("Wrote workbook to %s", saved)
