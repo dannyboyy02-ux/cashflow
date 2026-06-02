@@ -976,3 +976,13 @@ def test_min_cash_policy_no_draw_when_pre_positive(tmp_path):
     for row in resolved:
         if row["pre"] > 0:
             assert row["draw"] == pytest.approx(0.0)
+
+
+def test_assumptions_has_po_certainty_tier_notation(tmp_path):
+    """FP&A standard: PO outstanding is disclosed as the lowest-certainty tier."""
+    wb = _build(tmp_path)
+    ws = wb[SHEET_NOTES]
+    text = "\n".join(str(ws.cell(r, 1).value or "") for r in range(1, ws.max_row + 1))
+    assert "Disbursement certainty tiers" in text
+    assert "Tier 3" in text and "ordered, not yet received" in text
+    assert "haircut" in text.lower()

@@ -1031,6 +1031,36 @@ def _build_assumptions_sheet(
             "is a queued v2 enhancement.",
             False,
         ),
+        ("", False),
+        ("Disbursement certainty tiers (FP&A convention)", True),
+        (
+            "  Tier 1 - contractual / committed (high certainty): open AP invoices, "
+            "scheduled BC payments, debt service, payroll. Due on known terms.",
+            False,
+        ),
+        (
+            "  Tier 2 - received, not yet invoiced (RBNI): goods are in hand and a "
+            "vendor invoice is imminent (~7 days), so conversion to cash is near-"
+            "certain; timing is the only estimate.",
+            False,
+        ),
+        (
+            "  Tier 3 - ordered, not yet received (PO outstanding): committed but "
+            "LOWEST in-horizon certainty -- the order can still be changed, "
+            "delayed, or cancelled before receipt. Included here at 100% (gross), "
+            "which is a deliberately CONSERVATIVE liquidity view (overstates near-"
+            "term outflow). It is the single largest swing factor in the revolver "
+            "draw. A probability/conversion haircut on Tier 3 is the recommended "
+            "next refinement (config-driven, e.g. po_outstanding_haircut_pct).",
+            False,
+        ),
+        (
+            "  Read the headline with this in mind: peak revolver draw is inflated "
+            "by Tier 3 at full weight. The Revolver tab's Ending Revolver Balance "
+            "is the point-in-time draw, well inside the facility once Tier 3 is "
+            "weighted to realistic conversion.",
+            False,
+        ),
     ]
 
     for i, (text, is_header) in enumerate(lines, start=1):
